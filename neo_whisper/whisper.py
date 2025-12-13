@@ -3,6 +3,7 @@
 
 
 from typing import Iterable, Optional
+from dataclasses import dataclass
 import math
 import torch
 import torch.nn.functional as F
@@ -24,6 +25,11 @@ from .nn_utils import (
     KVCache,
     CausalSelfAttention
 )
+
+
+@dataclass
+class NeoModelDimensions(ModelDimensions):
+    n_text_kv_head: int
 
 
 class MLP(nn.Module):
@@ -168,7 +174,7 @@ class TextDecoder(nn.Module):
 
 
 class NeoWhisper(Whisper):
-    def __init__(self, dims: ModelDimensions):
+    def __init__(self, dims: NeoModelDimensions):
         super().__init__(dims)
         del self.decoder
         self.decoder = TextDecoder(
@@ -189,14 +195,17 @@ class NeoWhisper(Whisper):
         return True
 
     @torch.inference_mode()
-    def generate(self, mels, tokens, max_tokens=100, temperature=1.0, top_k=None, seed=42):
-        assert isinstance(tokens, list)
+    def generate(self, mels, sot_tokens, max_tokens=100, temperature=1.0, top_k=None, seed=42):
+        # naif implementation for speech decoding
+        assert mels.shape[0] == 1, "Does not support batch audio yet"
+        assert isinstance(sot_tokens, list)
+        assert len(sot_tokens) == 4, "Only support no_timestamps and cannot infer language given speech"
         device = self.device
         rng = None
         if temperature > 0:
             rng = torch.Generator(device=device)
             rng.manual_seed(seed)
-        ids = torch.tensor([tokens], dtype=torch.long, device=device)
+        ids = torch.tensor([sot_tokens], dtype=torch.long, device=device)
         for _ in range(max_tokens):
             logits = self.forward(mels, ids)  # (B, T, vocab_size)
             logits = logits[:, -1, :]  # (B, vocab_size) only consider the last prediction
