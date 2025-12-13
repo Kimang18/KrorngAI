@@ -14,6 +14,9 @@ from whisper.tokenizer import (
 
 class NeoTokenizer(Tokenizer):
     def decode(self, token_ids: List[int], skip_special_tokens: bool = False, **kwargs) -> str:
+        """
+        Re-implement by adding skip_special_tokens option
+        """
         token_ids = [t for t in token_ids if t < self.timestamp_begin]
         if skip_special_tokens:
             token_ids = [
@@ -23,6 +26,10 @@ class NeoTokenizer(Tokenizer):
 
 @lru_cache(maxsize=None)
 def get_encoding(name: str = "gpt2", num_languages: int = 99):
+    """
+    Inspired by https://github.com/openai/tiktoken/tree/main, Section Extending tiktoken
+    And tokenizer.py of OpenAI/whisper
+    """
     encoder_decoder = tiktoken.get_encoding(name)
 
     n_vocab = len(encoder_decoder._mergeable_ranks)
