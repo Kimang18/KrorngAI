@@ -1,4 +1,5 @@
 # Author: KrorngAI Org.
+# Date: December, 2025
 
 
 from typing import Iterable, Optional
@@ -9,7 +10,6 @@ from torch import Tensor, nn
 
 from whisper.model import (
     ModelDimensions,
-    Linear,
     MultiHeadAttention,
     Whisper
 )
@@ -18,6 +18,8 @@ from .decoding import decode as decode_function
 from whisper.decoding import detect_language as detect_language_function
 from .nn_utils import (
     norm,
+    LinearWrapper,
+    LayerNormWrapper,
     Conv1D,
     KVCache,
     CausalSelfAttention
@@ -49,7 +51,7 @@ class ResidualAttentionBlock(nn.Module):
 
         self.attn = CausalSelfAttention(layer_idx, n_state, n_head, n_kv_head)
         self.cross_attn = MultiHeadAttention(n_state, n_head)
-        # self.cross_attn_ln = LayerNorm(n_state)
+        self.cross_attn_ln = LayerNormWrapper(n_state)
         self.mlp = MLP(n_state)
 
     def forward(
@@ -61,7 +63,7 @@ class ResidualAttentionBlock(nn.Module):
     ):
         attn_kv_cache: KVCache = kv_cache['neo'] if kv_cache else None
         x = x + self.attn(norm(x), cos_sin=cos_sin, kv_cache=attn_kv_cache)
-        x = x + self.cross_attn(norm(x), xa, kv_cache=kv_cache)[0]
+        x = x + self.cross_attn(self.cross_attn_ln(x), xa, kv_cache=kv_cache)[0]
         x = x + self.mlp(norm(x))
         return x
 
@@ -82,7 +84,7 @@ class TextDecoder(nn.Module):
                 for layer_idx in range(n_layer)
             ]
         )
-        self.lm_head = Linear(n_state, n_vocab, bias=False)
+        self.lm_head = LinearWrapper(n_state, n_vocab, bias=False)
 
         self.rotary_seq_len = n_ctx * 10
         head_dim = n_state // n_head
