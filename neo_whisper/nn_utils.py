@@ -1,4 +1,5 @@
-# Copyright © 2025 KrorngAI Org.
+# Author: KrorngAI Org.
+# Date: December, 2025
 
 
 from typing import Optional
