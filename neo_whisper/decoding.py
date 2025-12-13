@@ -24,6 +24,7 @@ from whisper.decoding import (
 
 if TYPE_CHECKING:
     from .model import Whisper
+    from .whisper import NeoWhisper
 
 from .tokenizer import get_tokenizer, NeoTokenizer
 from .nn_utils import KVCache
@@ -36,7 +37,7 @@ class NeoDecodingOptions(DecodingOptions):
 
 
 class NeoPyTorchInference(PyTorchInference):
-    def __init__(self, model: "Whisper", initial_token_length: int):
+    def __init__(self, model: "NeoWhisper", initial_token_length: int):
         super().__init__(model, initial_token_length)
         self.kv_model_kwargs = {
             "num_heads": self.model.dims.n_text_head,
@@ -64,7 +65,7 @@ class NeoPyTorchInference(PyTorchInference):
 
 
 class NeoDecodingTask(DecodingTask):
-    def __init__(self, model: "Whisper", options: DecodingOptions):
+    def __init__(self, model: "NeoWhisper", options: DecodingOptions):
         self.model = model
 
         tokenizer_name = options.tokenizer_name or "gpt2"
@@ -92,8 +93,8 @@ class NeoDecodingTask(DecodingTask):
         self.sot_index: int = self.initial_tokens.index(tokenizer.sot)
 
         # inference: implements the forward pass through the decoder, including kv caching
+        #TODO : this does not work for Whisper yet
         self.inference = NeoPyTorchInference(model, len(self.initial_tokens))
-        # self.inference = PyTorchInference(model, len(self.initial_tokens))
 
         # sequence ranker: implements how to rank a group of sampled sequences
         self.sequence_ranker = MaximumLikelihoodRanker(options.length_penalty)
