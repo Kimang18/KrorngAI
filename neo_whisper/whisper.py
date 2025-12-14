@@ -82,8 +82,8 @@ class TextDecoder(nn.Module):
 
         self.n_state = n_state
         self.n_head = n_head
-        self.token_embedding = nn.Embedding(n_vocab, n_state)
 
+        self.token_embedding = nn.Embedding(n_vocab, n_state)
         self.blocks: Iterable[ResidualAttentionBlock] = nn.ModuleList(
             [
                 ResidualAttentionBlock(layer_idx, n_state, n_head, n_head)
@@ -165,10 +165,10 @@ class TextDecoder(nn.Module):
         x = norm(x)
 
         logits = self.lm_head(x)
-        logits = logits.float()
 
         softcap = 15
         logits = softcap * torch.tanh(logits / softcap)
+        logits = logits.float()
 
         return logits
 
