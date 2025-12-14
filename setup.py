@@ -1,3 +1,7 @@
+# Author: KrorngAI org
+# Date: December 2025
+
+
 from setuptools import setup, find_packages
 
 
