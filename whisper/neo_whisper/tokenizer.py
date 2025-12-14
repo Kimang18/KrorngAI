@@ -3,13 +3,18 @@
 
 
 from typing import List, Optional
-from whisper.tokenizer import (
-    lru_cache,
-    Tokenizer,
-    tiktoken,
-    LANGUAGES,
-    TO_LANGUAGE_CODE
-)
+
+try:
+    from whisper.tokenizer import (
+        lru_cache,
+        Tokenizer,
+        tiktoken,
+        LANGUAGES,
+        TO_LANGUAGE_CODE
+    )
+except (ImportError, ModuleNotFoundError):
+    print("You need to install openai-whisper package: pip install git+https://github.com/openai/whisper.git")
+    raise
 
 
 class NeoTokenizer(Tokenizer):

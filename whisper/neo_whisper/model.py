@@ -8,11 +8,14 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
-
-from whisper.decoding import detect_language as detect_language_function
-from whisper.transcribe import transcribe as transcribe_function
-
 from .decoding import decode as decode_function  # import from local to support more tokenizers
+
+try:
+    from whisper.decoding import detect_language as detect_language_function
+    from whisper.transcribe import transcribe as transcribe_function
+except (ImportError, ModuleNotFoundError):
+    print("You need to install openai-whisper package: pip install git+https://github.com/openai/whisper.git")
+    raise
 
 try:
     from torch.nn.functional import scaled_dot_product_attention

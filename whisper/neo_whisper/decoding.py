@@ -8,19 +8,23 @@ from typing import TYPE_CHECKING, List, Tuple, Union
 import torch
 from torch import Tensor
 
-from whisper.audio import CHUNK_LENGTH
-from whisper.decoding import (
-    DecodingOptions,
-    DecodingResult,
-    PyTorchInference,
-    MaximumLikelihoodRanker,
-    GreedyDecoder,
-    BeamSearchDecoder,
-    SuppressBlank,
-    SuppressTokens,
-    ApplyTimestampRules,
-    DecodingTask,
-)
+try:
+    from whisper.audio import CHUNK_LENGTH
+    from whisper.decoding import (
+        DecodingOptions,
+        DecodingResult,
+        PyTorchInference,
+        MaximumLikelihoodRanker,
+        GreedyDecoder,
+        BeamSearchDecoder,
+        SuppressBlank,
+        SuppressTokens,
+        ApplyTimestampRules,
+        DecodingTask,
+    )
+except (ImportError, ModuleNotFoundError):
+    print("You need to install openai-whisper package: pip install git+https://github.com/openai/whisper.git")
+    raise
 
 if TYPE_CHECKING:
     from .model import Whisper

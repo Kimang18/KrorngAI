@@ -9,14 +9,18 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from whisper.model import (
-    ModelDimensions,
-    MultiHeadAttention,
-    Whisper
-)
+try:
+    from whisper.model import (
+        ModelDimensions,
+        MultiHeadAttention,
+        Whisper
+    )
+    from whisper.decoding import detect_language as detect_language_function
+except (ImportError, ModuleNotFoundError):
+    print("You need to install openai-whisper package: pip install git+https://github.com/openai/whisper.git")
+    raise
 
 from .decoding import decode as decode_function
-from whisper.decoding import detect_language as detect_language_function
 from .nn_utils import (
     norm,
     LinearWrapper,
@@ -25,6 +29,7 @@ from .nn_utils import (
     KVCache,
     CausalSelfAttention
 )
+from .common import print_banner
 
 
 @dataclass
@@ -165,7 +170,6 @@ class TextDecoder(nn.Module):
         x = norm(x)
 
         logits = self.lm_head(x)
-
         softcap = 15
         logits = softcap * torch.tanh(logits / softcap)
         logits = logits.float()
@@ -174,7 +178,7 @@ class TextDecoder(nn.Module):
 
 
 class NeoWhisper(Whisper):
-    def __init__(self, dims: NeoModelDimensions):
+    def __init__(self, dims: NeoModelDimensions, verbose=False):
         super().__init__(dims)
         del self.decoder
         self.decoder = TextDecoder(
@@ -185,6 +189,8 @@ class NeoWhisper(Whisper):
             self.dims.n_text_layer,
         )
         self.decoder.init_weights()
+        if verbose:
+            print_banner()
 
     @property
     def num_languages(self):
