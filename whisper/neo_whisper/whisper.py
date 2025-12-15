@@ -204,8 +204,7 @@ class TextDecoder(nn.Module):
         T0 = kv_cache['neo'].get_pos() if kv_cache else 0
         cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T]
 
-        x = self.token_embedding(x) # (B, T, n_state)
-        # x = norm(x)
+        x = self.token_embedding(x)  # (B, T, n_state)
         x = x.to(xa.dtype)
 
         for block in self.blocks:
