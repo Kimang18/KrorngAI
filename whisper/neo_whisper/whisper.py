@@ -25,6 +25,7 @@ from .nn_utils import (
     norm,
     LinearWrapper,
     LayerNormWrapper,
+    Conv1dWrapper,
     Conv1D,
     KVCache,
     CausalSelfAttention
@@ -35,6 +36,17 @@ from .common import print_banner
 @dataclass
 class NeoModelDimensions(ModelDimensions):
     n_text_kv_head: int
+
+
+def precompute_rotary_emb(seq_len, head_dim, device, base=10000):
+    channel_range = torch.arange(0, head_dim, 2, dtype=torch.float32, device=device)
+    inv_freq = 1.0 / (base ** (channel_range / head_dim))
+    t = torch.arange(seq_len, dtype=torch.float32, device=device)
+    freqs = torch.outer(t, inv_freq)
+    cos, sin = freqs.cos(), freqs.sin()
+    cos, sin = cos.bfloat16(), sin.bfloat16()
+    cos, sin = cos[None, :, None, :], sin[None, :, None, :]
+    return cos, sin
 
 
 class MLP(nn.Module):
@@ -57,12 +69,12 @@ class ResidualAttentionBlock(nn.Module):
     To avoid complication, I fallback to original MultiHeadAttention of whisper package for cross attention
     """
 
-    def __init__(self, layer_idx: int, n_state: int, n_head: int, n_kv_head: int):
+    def __init__(self, layer_idx: int, n_state: int, n_head: int, n_kv_head: int, cross_attn: bool=False):
         super().__init__()
 
         self.attn = CausalSelfAttention(layer_idx, n_state, n_head, n_kv_head)
-        self.cross_attn = MultiHeadAttention(n_state, n_head)
-        self.cross_attn_ln = LayerNormWrapper(n_state)
+        self.cross_attn = MultiHeadAttention(n_state, n_head) if cross_attn else None
+        self.cross_attn_ln = LayerNormWrapper(n_state) if cross_attn else None
         self.mlp = MLP(n_state)
 
     def forward(
@@ -74,9 +86,52 @@ class ResidualAttentionBlock(nn.Module):
     ):
         attn_kv_cache: KVCache = kv_cache['neo'] if kv_cache else None
         x = x + self.attn(norm(x), cos_sin=cos_sin, kv_cache=attn_kv_cache)
-        x = x + self.cross_attn(self.cross_attn_ln(x), xa, kv_cache=kv_cache)[0]
+        if self.cross_attn:
+            x = x + self.cross_attn(self.cross_attn_ln(x), xa, kv_cache=kv_cache)[0]
         x = x + self.mlp(norm(x))
         return x
+
+
+class AudioEncoder(nn.Module):
+    def __init__(
+        self, n_mels: int, n_ctx: int, n_state: int, n_head: int, n_layer: int
+    ):
+        super().__init__()
+        self.conv1 = Conv1dWrapper(n_mels, n_state, kernel_size=3, padding=1)
+        self.conv2 = Conv1dWrapper(n_state, n_state, kernel_size=3, stride=2, padding=1)
+        self.blocks: Iterable[ResidualAttentionBlock] = nn.ModuleList(
+            [
+                ResidualAttentionBlock(layer_idx, n_state, n_head, n_head)
+                for layer_idx in range(n_layer)
+            ]
+        )
+        head_dim = n_state // n_head
+        cos, sin = precompute_rotary_emb(2*n_ctx, head_dim, self.device)
+        self.register_buffer("cos", cos, persistent=False)
+        self.register_buffer("sin", sin, persistent=False)
+
+    def forward(self, x: Tensor):
+        """
+        x : torch.Tensor, shape = (batch_size, n_mels, n_ctx)
+            the mel spectrogram of the audio
+        """
+
+        x = F.gelu(self.conv1(x))
+        x = F.gelu(self.conv2(x))  # (batch_size, n_mels, 2*n_ctx)
+        x = x.permute(0, 2, 1)  # (batch_size, 2*n_ctx, n_mels)
+
+        B, N_CTX, C = x.size()
+        cos_sin = self.cos[:, :N_CTX], self.sin[:, :N_CTX]
+
+        for block in self.blocks:
+            x = block(x, cos_sin=cos_sin, kv_cache=None)
+
+        x = norm(x)
+        return x
+
+    @property
+    def device(self):
+        return self.conv1.weight.device
 
 
 class TextDecoder(nn.Module):
@@ -91,7 +146,7 @@ class TextDecoder(nn.Module):
         self.token_embedding = nn.Embedding(n_vocab, n_state)
         self.blocks: Iterable[ResidualAttentionBlock] = nn.ModuleList(
             [
-                ResidualAttentionBlock(layer_idx, n_state, n_head, n_head)
+                ResidualAttentionBlock(layer_idx, n_state, n_head, n_head, cross_attn=True)
                 for layer_idx in range(n_layer)
             ]
         )
@@ -99,7 +154,7 @@ class TextDecoder(nn.Module):
 
         self.rotary_seq_len = n_ctx * 10
         head_dim = n_state // n_head
-        cos, sin = self._precompute_rotary_emb(self.rotary_seq_len, head_dim)
+        cos, sin = precompute_rotary_emb(self.rotary_seq_len, head_dim, self.device)
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
 
@@ -113,7 +168,7 @@ class TextDecoder(nn.Module):
             nn.init.zeros_(block.cross_attn.out.weight)
 
         head_dim = self.n_state // self.n_head
-        cos, sin = self._precompute_rotary_emb(self.rotary_seq_len, head_dim)
+        cos, sin = precompute_rotary_emb(self.rotary_seq_len, head_dim, self.device)
         self.cos, self.sin = cos, sin
 
         # Cast the embeddings from fp32 to bf16: optim can tolerate it and it saves memory: both in the model and the activations
@@ -132,18 +187,6 @@ class TextDecoder(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=1.0)
 
-    def _precompute_rotary_emb(self, seq_len, head_dim, base=10000, device=None):
-        if device is None:
-            device = self.token_embedding.weight.device
-        channel_range = torch.arange(0, head_dim, 2, dtype=torch.float32, device=device)
-        inv_freq = 1.0 / (base ** (channel_range / head_dim))
-        t = torch.arange(seq_len, dtype=torch.float32, device=device)
-        freqs = torch.outer(t, inv_freq)
-        cos, sin = freqs.cos(), freqs.sin()
-        cos, sin = cos.bfloat16(), sin.bfloat16()
-        cos, sin = cos[None, :, None, :], sin[None, :, None, :]
-        return cos, sin
-
     def forward(self, x: Tensor, xa: Tensor, kv_cache: Optional[dict] = None):
         """
         x : torch.LongTensor, shape = (batch_size, <= n_text_ctx)
@@ -152,17 +195,17 @@ class TextDecoder(nn.Module):
             the encoded audio features to be attended on
         """
 
-        n_batch, n_ctx = x.size()
+        B, T = x.size()
 
-        assert n_ctx <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {n_ctx} > {self.cos.size(1)}"
+        assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {n_ctx} > {self.cos.size(1)}"
         assert x.device == self.cos.device, f"Rotary embeddings and x are on different devices: {x.device} != {self.cos.device}"
         assert self.cos.dtype == torch.bfloat16, "Rotary embeddings must be in bfloat16"
 
         T0 = kv_cache['neo'].get_pos() if kv_cache else 0
-        cos_sin = self.cos[:, T0:T0+n_ctx], self.sin[:, T0:T0+n_ctx]
+        cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T]
 
-        x = self.token_embedding(x)
-        x = norm(x)
+        x = self.token_embedding(x) # (B, T, n_state)
+        # x = norm(x)
         x = x.to(xa.dtype)
 
         for block in self.blocks:
@@ -170,16 +213,32 @@ class TextDecoder(nn.Module):
         x = norm(x)
 
         logits = self.lm_head(x)
+
+        logits = logits.float()
         softcap = 15
         logits = softcap * torch.tanh(logits / softcap)
-        logits = logits.float()
 
         return logits
 
+    @property
+    def device(self):
+        return self.token_embedding.weight.device
+
 
 class NeoWhisper(Whisper):
-    def __init__(self, dims: NeoModelDimensions, verbose=False):
+    def __init__(self, dims: NeoModelDimensions, neo_encoder=True, verbose=False):
         super().__init__(dims)
+        if neo_encoder:
+            # Use RoPE in audio encoder
+            # NOTE: you then need to train the encoder from scratch
+            del self.encoder
+            self.encoder = AudioEncoder(
+                self.dims.n_mels,
+                self.dims.n_audio_ctx,
+                self.dims.n_audio_state,
+                self.dims.n_audio_head,
+                self.dims.n_audio_layer,
+            )
         del self.decoder
         self.decoder = TextDecoder(
             self.dims.n_vocab,
