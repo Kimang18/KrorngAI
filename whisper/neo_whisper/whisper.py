@@ -26,7 +26,7 @@ from .nn_utils import (
     LinearWrapper,
     LayerNormWrapper,
     Conv1dWrapper,
-    Conv1D,
+    # Conv1D,
     KVCache,
     CausalSelfAttention
 )
@@ -52,8 +52,8 @@ def precompute_rotary_emb(seq_len, head_dim, device, base=10000):
 class MLP(nn.Module):
     def __init__(self, n_state: int):
         super().__init__()
-        self.c_fc = Conv1D(n_state, 4 * n_state)
-        self.c_proj = Conv1D(4 * n_state, n_state)
+        self.c_fc = LinearWrapper(n_state, 4 * n_state)
+        self.c_proj = LinearWrapper(4 * n_state, n_state)
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -274,7 +274,8 @@ class NeoWhisper(Whisper):
             logits = self.forward(mels, ids)  # (B, T, vocab_size)
             logits = logits[:, -1, :]  # (B, vocab_size) only consider the last prediction
             if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                k = min(top_k, logits.size(-1))
+                v, _ = torch.topk(logits, k, dim=-1)
                 logits[logits < v[:, [-1]]] = -float('inf')
             if temperature > 0:
                 logits = logits / temperature

@@ -166,10 +166,10 @@ class CausalSelfAttention(nn.Module):
         self.n_head = n_head
         self.n_kv_head = n_kv_head
         self.head_dim = n_state // n_head
-        self.query = Conv1D(self.n_state, self.n_head * self.head_dim)
-        self.key = Conv1D(self.n_state, self.n_kv_head * self.head_dim, bias=False)
-        self.value = Conv1D(self.n_state, self.n_kv_head * self.head_dim)
-        self.out = Conv1D(self.n_state, self.n_state)
+        self.query = LinearWrapper(self.n_state, self.n_head * self.head_dim)
+        self.key = LinearWrapper(self.n_state, self.n_kv_head * self.head_dim, bias=False)
+        self.value = LinearWrapper(self.n_state, self.n_kv_head * self.head_dim)
+        self.out = LinearWrapper(self.n_state, self.n_state)
 
     def forward(
         self,
