@@ -8,6 +8,17 @@ import torch.nn.functional as F
 from torch import nn, Tensor
 
 
+def precompute_rotary_emb(seq_len, head_dim, device, base=10000):
+    channel_range = torch.arange(0, head_dim, 2, dtype=torch.float32, device=device)
+    inv_freq = 1.0 / (base ** (channel_range / head_dim))
+    t = torch.arange(seq_len, dtype=torch.float32, device=device)
+    freqs = torch.outer(t, inv_freq)
+    cos, sin = freqs.cos(), freqs.sin()
+    cos, sin = cos.bfloat16(), sin.bfloat16()
+    cos, sin = cos[None, :, None, :], sin[None, :, None, :]
+    return cos, sin
+
+
 def norm(x):
     return F.rms_norm(x, (x.size(-1), ))
 
