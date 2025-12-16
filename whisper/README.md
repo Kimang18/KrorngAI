@@ -63,6 +63,7 @@ __NOTE:__ When using __new__ tokenizer, you need to train your model.
 
 ## Train TextDecoder
 When the config of `AudioEncoder` is the same as the original whisper audio encoder trained by OpenAI, we can load pre-trained weight for the encoder and just train the text decoder.
+To load model with `AudioEncoder` of OpenAI whisper, simply provide `neo_encoder=False` when initialize `NeoWhisper` (by default, `neo_encoder=True`).
 
 ```python
 from neo_whisper import NeoWhisper, NeoModelDimensions
@@ -81,7 +82,7 @@ dims = NeoModelDimensions(
     n_text_kv_head=4,
     n_text_layer=6
 )
-model = NeoWhisper(dims)
+model = NeoWhisper(dims, neo_encoder=False)
 # load pre-trained weight of audio encoder
 model.encoder.load_state_dict(whisper.load_model("tiny").encoder.state_dict())
 # freeze the pre-trained weight
