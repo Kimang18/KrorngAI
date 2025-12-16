@@ -2,7 +2,7 @@
 # Date: December, 2025
 
 
-from typing import Iterable, Optional
+from typing import Iterable, Optional, Tuple
 from dataclasses import dataclass
 import math
 import torch
@@ -23,6 +23,7 @@ except (ImportError, ModuleNotFoundError):
 from .decoding import decode as decode_function
 from .nn_utils import (
     norm,
+    apply_rotary_emb,
     LinearWrapper,
     LayerNormWrapper,
     Conv1dWrapper,
@@ -49,6 +50,60 @@ def precompute_rotary_emb(seq_len, head_dim, device, base=10000):
     return cos, sin
 
 
+class CrossAttention(CausalSelfAttention):
+    def forward(
+        self,
+        x: Tensor,
+        xa: Tensor,
+        cos_sin=None,
+        cos_sin_a=None,
+        kv_cache=None
+    ):
+        q = self.query(x).view(*x.shape[:2], self.n_head, self.head_dim)
+        k = self.key(xa).view(*xa.shape[:2], self.n_kv_head, self.head_dim)
+        v = self.value(xa).view(*xa.shape[:2], self.n_kv_head, self.head_dim)
+
+        # Apply Rotary Embeddings to queries and keys to get relative positional encoding
+        cos, sin = cos_sin
+        # cos_a, sin_a = cos_sin_a
+        # q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos_a, sin_a)
+        # q, k = norm(q), norm(k)
+        q = apply_rotary_emb(q, cos, sin)
+        q = norm(q)
+        q, k, v = q.permute(0, 2, 1, 3), k.permute(0, 2, 1, 3), v.permute(0, 2, 1, 3)
+
+        if kv_cache is not None:
+            k, v = kv_cache.insert_kv(self.layer_idx, k, v)
+        Tq = q.size(2)
+        Tk = k.size(2)
+
+        # Group Query Attention (GQA): duplicate key/value heads to match query heads if desired
+        enable_gqa = self.n_head != self.n_kv_head
+        #TODO: fix the condition below for inference
+        if kv_cache is None or Tq == Tk:
+            # During training (no KV cache), attend as usual with causal attention
+            # And even if there is KV cache, we can still use this simple version when Tq == Tk
+            a = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=enable_gqa)
+        elif Tq == 1:
+            # During inference but with a single query in this forward pass:
+            # The query has to attend to all the key/values in the cache
+            a = F.scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=enable_gqa)
+        else:
+            # During inference AND we have a chunk of queries in this forward pass:
+            # First, each query attends to all the cached keys/value (i.e. full prefix)
+            attn_mask = torch.zeros(
+                (Tq, Tk), dtype=torch.bool, device=q.device)
+            prefix_len = Tk - Tq
+            attn_mask[:, :prefix_len] = True
+            # Then, causal attention within this chunk
+            attn_mask[:, prefix_len:] = torch.tril(torch.ones((Tq, Tq), dtype=torch.bool, device=q.device))
+            a = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, enable_gqa=enable_gqa)
+
+        # Re-assemble the heads side by side and project back to residual stream
+        out = a.permute(0, 2, 1, 3).flatten(start_dim=2)
+        return self.out(out)
+
+
 class MLP(nn.Module):
     def __init__(self, n_state: int):
         super().__init__()
@@ -73,8 +128,9 @@ class ResidualAttentionBlock(nn.Module):
         super().__init__()
 
         self.attn = CausalSelfAttention(layer_idx, n_state, n_head, n_kv_head)
-        self.cross_attn = MultiHeadAttention(n_state, n_head) if cross_attn else None
-        self.cross_attn_ln = LayerNormWrapper(n_state) if cross_attn else None
+        # self.cross_attn = MultiHeadAttention(n_state, n_head) if cross_attn else None
+        # self.cross_attn_ln = LayerNormWrapper(n_state) if cross_attn else None
+        self.cross_attn = CrossAttention(layer_idx, n_state, n_head, n_kv_head) if cross_attn else None
         self.mlp = MLP(n_state)
 
     def forward(
@@ -82,12 +138,14 @@ class ResidualAttentionBlock(nn.Module):
         x: Tensor,
         xa: Optional[Tensor] = None,
         cos_sin=None,
+        cos_sin_a=None,
         kv_cache: Optional[dict] = None,
     ):
         attn_kv_cache: KVCache = kv_cache['neo'] if kv_cache else None
         x = x + self.attn(norm(x), cos_sin=cos_sin, kv_cache=attn_kv_cache)
         if self.cross_attn:
-            x = x + self.cross_attn(self.cross_attn_ln(x), xa, kv_cache=kv_cache)[0]
+            # x = x + self.cross_attn(self.cross_attn_ln(x), xa, kv_cache=kv_cache)[0]
+            x = x + self.cross_attn(norm(x), xa, cos_sin, cos_sin_a, kv_cache=kv_cache)
         x = x + self.mlp(norm(x))
         return x
 
@@ -105,24 +163,24 @@ class AudioEncoder(nn.Module):
                 for layer_idx in range(n_layer)
             ]
         )
+        self.n_ctx = n_ctx
+        self.rotary_aud_len = 10*n_ctx
         head_dim = n_state // n_head
-        cos, sin = precompute_rotary_emb(2*n_ctx, head_dim, self.device)
+        cos, sin = precompute_rotary_emb(self.rotary_aud_len, head_dim, self.device)
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
 
     def forward(self, x: Tensor):
         """
-        x : torch.Tensor, shape = (batch_size, n_mels, n_ctx)
+        x : torch.Tensor, shape = (batch_size, n_mels, 2*n_ctx(=3000))
             the mel spectrogram of the audio
         """
 
         x = F.gelu(self.conv1(x))
-        x = F.gelu(self.conv2(x))  # (batch_size, n_mels, 2*n_ctx)
-        x = x.permute(0, 2, 1)  # (batch_size, 2*n_ctx, n_mels)
+        x = F.gelu(self.conv2(x))  # (batch_size, n_state, n_ctx)
+        x = x.permute(0, 2, 1)  # (batch_size, n_ctx, n_state)
 
-        B, N_CTX, C = x.size()
-        cos_sin = self.cos[:, :N_CTX], self.sin[:, :N_CTX]
-
+        cos_sin = self.cos[:, :self.n_ctx], self.sin[:, :self.n_ctx]
         for block in self.blocks:
             x = block(x, cos_sin=cos_sin, kv_cache=None)
 
@@ -136,12 +194,13 @@ class AudioEncoder(nn.Module):
 
 class TextDecoder(nn.Module):
     def __init__(
-        self, n_vocab: int, n_ctx: int, n_state: int, n_head: int, n_layer: int
+        self, n_vocab: int, n_ctx: int, n_state: int, n_head: int, n_layer: int, n_audio_ctx: int
     ):
         super().__init__()
 
         self.n_state = n_state
         self.n_head = n_head
+        self.n_audio_ctx = n_audio_ctx
 
         self.token_embedding = nn.Embedding(n_vocab, n_state)
         self.blocks: Iterable[ResidualAttentionBlock] = nn.ModuleList(
@@ -153,10 +212,14 @@ class TextDecoder(nn.Module):
         self.lm_head = LinearWrapper(n_state, n_vocab, bias=False)
 
         self.rotary_seq_len = n_ctx * 10
+        self.rotary_aud_len = n_audio_ctx * 10
         head_dim = n_state // n_head
         cos, sin = precompute_rotary_emb(self.rotary_seq_len, head_dim, self.device)
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
+        # cos_a, sin_a = precompute_rotary_emb(self.rotary_aud_len, head_dim, self.device)
+        # self.register_buffer("cos_a", cos_a, persistent=False)
+        # self.register_buffer("sin_a", sin_a, persistent=False)
 
     def init_weights(self):
         self.apply(self._init_weights)
@@ -170,6 +233,8 @@ class TextDecoder(nn.Module):
         head_dim = self.n_state // self.n_head
         cos, sin = precompute_rotary_emb(self.rotary_seq_len, head_dim, self.device)
         self.cos, self.sin = cos, sin
+        # cos_a, sin_a = precompute_rotary_emb(self.rotary_aud_len, head_dim, self.device)
+        # self.cos_a, self.sin_a = cos_a, sin_a
 
         # Cast the embeddings from fp32 to bf16: optim can tolerate it and it saves memory: both in the model and the activations
         if self.token_embedding.weight.device.type == "cuda":
@@ -203,12 +268,13 @@ class TextDecoder(nn.Module):
 
         T0 = kv_cache['neo'].get_pos() if kv_cache else 0
         cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T]
+        cos_sin_a = self.cos[:, :self.n_audio_ctx], self.sin[:, :self.n_audio_ctx]
 
         x = self.token_embedding(x)  # (B, T, n_state)
         x = x.to(xa.dtype)
 
         for block in self.blocks:
-            x = block(x, xa, cos_sin=cos_sin, kv_cache=kv_cache)
+            x = block(x, xa, cos_sin=cos_sin, cos_sin_a=cos_sin_a, kv_cache=kv_cache)
         x = norm(x)
 
         logits = self.lm_head(x)
@@ -245,6 +311,7 @@ class NeoWhisper(Whisper):
             self.dims.n_text_state,
             self.dims.n_text_head,
             self.dims.n_text_layer,
+            self.dims.n_audio_ctx
         )
         self.decoder.init_weights()
         if verbose:
