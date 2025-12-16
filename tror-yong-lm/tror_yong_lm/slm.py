@@ -12,9 +12,9 @@ from torch import Tensor, nn
 from .nn_utils import (
     norm,
     LinearWrapper,
-    Conv1D,
     KVCache,
-    CausalSelfAttention
+    CausalSelfAttention,
+    precompute_rotary_emb
 )
 from .common import print_banner
 
@@ -32,8 +32,8 @@ class ModelDimensions:
 class MLP(nn.Module):
     def __init__(self, n_state: int):
         super().__init__()
-        self.c_fc = Conv1D(n_state, 4 * n_state)
-        self.c_proj = Conv1D(4 * n_state, n_state)
+        self.c_fc = LinearWrapper(n_state, 4 * n_state)
+        self.c_proj = LinearWrapper(4 * n_state, n_state)
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -81,7 +81,7 @@ class SLM(nn.Module):
 
         self.rotary_seq_len = dims.n_ctx * 10
         self.head_dim = dims.n_state // dims.n_head
-        cos, sin = self._precompute_rotary_emb(self.rotary_seq_len, self.head_dim)
+        cos, sin = precompute_rotary_emb(self.rotary_seq_len, self.head_dim, self.device)
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
         print_banner()
@@ -94,7 +94,7 @@ class SLM(nn.Module):
             nn.init.zeros_(block.mlp.c_proj.weight)
             nn.init.zeros_(block.attn.out.weight)
 
-        cos, sin = self._precompute_rotary_emb(self.rotary_seq_len, self.head_dim)
+        cos, sin = precompute_rotary_emb(self.rotary_seq_len, self.head_dim, self.device)
         self.cos, self.sin = cos, sin
 
         # Cast the embeddings from fp32 to bf16: optim can tolerate it and it saves memory: both in the model and the activations
@@ -111,22 +111,6 @@ class SLM(nn.Module):
                 nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=1.0)
-
-    def _precompute_rotary_emb(self, seq_len, head_dim, base=10000, device=None):
-        if device is None:
-            device = self.device
-        channel_range = torch.arange(0, head_dim, 2, dtype=torch.float32, device=device)
-        inv_freq = 1.0 / (base ** (channel_range / head_dim))
-        t = torch.arange(seq_len, dtype=torch.float32, device=device)
-        freqs = torch.outer(t, inv_freq)
-        cos, sin = freqs.cos(), freqs.sin()
-        cos, sin = cos.bfloat16(), sin.bfloat16()
-        cos, sin = cos[None, :, None, :], sin[None, :, None, :]
-        return cos, sin
-
-    @property
-    def device(self):
-        return self.token_embedding.weight.device
 
     def forward(self, x: Tensor, kv_cache: Optional[KVCache] = None):
         """
@@ -152,10 +136,15 @@ class SLM(nn.Module):
         x = norm(x)
 
         logits = self.lm_head(x)
+        logits = logits.float()
+
         softcap = 15
         logits = softcap * torch.tanh(logits / softcap)
-        logits = logits.float()
         return logits
+
+    @property
+    def device(self):
+        return self.token_embedding.weight.device
 
     @torch.inference_mode()
     def generate(self, initial_tokens, max_tokens=100, temperature=1.0, top_k=None, seed=42):
