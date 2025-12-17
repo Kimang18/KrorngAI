@@ -15,12 +15,13 @@ try:
         MultiHeadAttention,
         Whisper
     )
-    from whisper.decoding import detect_language as detect_language_function
+    # from whisper.decoding import detect_language as detect_language_function
 except (ImportError, ModuleNotFoundError):
     print("You need to install openai-whisper package: pip install git+https://github.com/openai/whisper.git")
     raise
 
 from .decoding import decode as decode_function
+from .decoding import detect_language as detect_language_function
 from .nn_utils import (
     precompute_rotary_emb,
     norm,
