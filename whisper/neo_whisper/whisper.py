@@ -2,7 +2,7 @@
 # Date: December, 2025
 
 
-from typing import Iterable, Optional, Tuple
+from typing import Iterable, Optional, Tuple, Dict
 from dataclasses import dataclass
 import math
 import torch
@@ -164,6 +164,32 @@ class AudioEncoder(nn.Module):
 
         x = norm(x)
         return x
+
+    def load_state_dict(self, state_dict: Dict[str, Tensor]):
+        """
+        override load_state_dict function to load whisper encoder
+        """
+        layers_mapping = {}
+        for i in range(len(self.blocks)):
+            layers_mapping[f'blocks.{i}.mlp.0.weight'] = f'blocks.{i}.mlp.c_fc.weight'
+            layers_mapping[f'blocks.{i}.mlp.0.bias'] = f'blocks.{i}.mlp.c_fc.bias'
+            layers_mapping[f'blocks.{i}.mlp.2.weight'] = f'blocks.{i}.mlp.c_proj.weight'
+            layers_mapping[f'blocks.{i}.mlp.2.bias'] = f'blocks.{i}.mlp.c_proj.bias'
+        new_state_dict = {}
+        for old_layer, value in state_dict.items():
+            if old_layer in layers_mapping:
+                new_layer = layers_mapping[old_layer]
+                new_state_dict[new_layer] = value
+            else:
+                new_state_dict[old_layer] = value
+        # filter out unused layers of whisper encoder
+        model_dict = self.state_dict()
+        filtered_dict = {
+            k: v for k, v in new_state_dict.items()
+            if k in model_dict and v.size() == model_dict[k].size()
+        }
+        # load weight
+        self.load_state_dict(filtered_dict, strict=False)
 
     @property
     def device(self):
