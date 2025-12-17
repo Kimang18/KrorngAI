@@ -90,8 +90,44 @@ for p in model.encoder.parameters():
     p.requires_grad = False
 ```
 
+## Transcription
+We can use trained model for transcription in the same way as `openai-whisper` pypi.
+The only difference is that you must specify `tokenizer_name` properly.
+Concretely, tokenizer used in the transcription task must be the tokenizer used to train the model.
+So, `tokenizer_name` __must be provided__ in the arguments of `transcribe`.
+
+```python
+from neo_whisper import (
+    get_tokenizer,
+    NeoWhisper,
+    NeoModelDimensions,
+    transcribe
+)
+tokenizer_name = 'cl100k_base'
+tokenizer = get_tokenizer(multilingual=True, task='transcribe', encoder_name=tokenizer_name)
+dims = NeoModelDimensions(
+    n_vocab=tokenizer.encoding.n_vocab, # use the tokenizer's vocab size
+    n_mels=80,       # or whatever context size you're training with
+    n_audio_ctx=1500,
+    n_audio_state=384,
+    n_audio_head=6,
+    n_audio_layer=4,
+    n_text_ctx=448,
+    n_text_state=384,
+    n_text_head=4,
+    n_text_kv_head=4,
+    n_text_layer=6
+)
+model = NeoWhisper(dims, neo_encoder=False) # if you use neo_encoder, specify accordingly
+best_model_params_path = "path/to/your/weights.pt"
+model.load_state_dict(torch.load(best_model_params_path))
+
+result = transcribe(wmodel, audio_array, verbose=True, tokenizer_name=tokenizer_name)
+print(result['text'])
+```
+
 ## TODO:
 - [X] implement decoding function for `NeoWhisper` and `Whisper`
+- [X] implement transcription for `NeoWhisper` and `Whisper`
 - [ ] notebook colab for training `NeoWhisper`
-- [ ] implement transcription for `NeoWhisper` and `Whisper`
 - [ ] benchmarking
