@@ -20,7 +20,7 @@ from .common import print_banner
 
 
 @dataclass
-class ModelDimensions:
+class TrorYongConfig:
     n_vocab: int
     n_ctx: int
     n_state: int
@@ -65,22 +65,22 @@ class ResidualAttentionBlock(nn.Module):
         return x
 
 
-class SLM(nn.Module):
-    def __init__(self, dims: ModelDimensions):
+class TrorYongGPT(nn.Module):
+    def __init__(self, config: TrorYongConfig):
         super().__init__()
-        self.dims = dims
+        self.config = config
 
-        self.token_embedding = nn.Embedding(dims.n_vocab, dims.n_state)
+        self.token_embedding = nn.Embedding(config.n_vocab, config.n_state)
         self.blocks: Iterable[ResidualAttentionBlock] = nn.ModuleList(
             [
-                ResidualAttentionBlock(layer_idx, dims.n_state, dims.n_head, dims.n_kv_head)
-                for layer_idx in range(dims.n_layer)
+                ResidualAttentionBlock(layer_idx, config.n_state, config.n_head, config.n_kv_head)
+                for layer_idx in range(config.n_layer)
             ]
         )
-        self.lm_head = LinearWrapper(dims.n_state, dims.n_vocab, bias=False)
+        self.lm_head = LinearWrapper(config.n_state, config.n_vocab, bias=False)
 
-        self.rotary_seq_len = dims.n_ctx * 10
-        self.head_dim = dims.n_state // dims.n_head
+        self.rotary_seq_len = config.n_ctx * 10
+        self.head_dim = config.n_state // config.n_head
         cos, sin = precompute_rotary_emb(self.rotary_seq_len, self.head_dim, self.device)
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
@@ -147,9 +147,9 @@ class SLM(nn.Module):
         return self.token_embedding.weight.device
 
     @torch.inference_mode()
-    def generate(self, initial_tokens, max_tokens=100, temperature=1.0, top_k=None, seed=42):
+    def stream_generate(self, initial_tokens, max_tokens=100, temperature=1.0, top_k=None, kv_cache=None, seed=168):
         """
-        Naif implementation for speech decoding
+        Naif implementation for streaming inference
         initial_tokens: list of tokens
         """
         assert isinstance(initial_tokens, list)
@@ -158,10 +158,21 @@ class SLM(nn.Module):
         if temperature > 0:
             rng = torch.Generator(device=device)
             rng.manual_seed(seed)
-        ids = torch.tensor([initial_tokens], dtype=torch.long, device=device)
+
+        ids = torch.tensor([initial_tokens], dtype=torch.long, device=device)  # (1, T)
+
+        first_iteration = True
+        next_ids = None
         for _ in range(max_tokens):
-            ids_cond = ids if ids.size(1) <= self.dims.n_ctx else ids[:, -self.dims.n_ctx:]
-            logits = self.forward(ids_cond)  # (1, T, vocab_size)
+            if first_iteration or kv_cache is None:
+                # prefill kv_cache
+                ids_cond = ids
+                first_iteration = False
+            else:
+                # use kv_cache
+                ids_cond = next_ids
+
+            logits = self.forward(ids_cond, kv_cache)  # (1, T, vocab_size)
             logits = logits[:, -1, :]  # (1, vocab_size) only consider the last prediction
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
