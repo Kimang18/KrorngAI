@@ -1,6 +1,21 @@
 # TrorYong Language Model
 
-`TrorYongGPT`, Small Language Model with Rotary Positional Embeddings, is a re-implementation of GPT2 by OpenAI.
+`TrorYongGPT`, Small Language Model with Rotary Positional Embeddings, is a re-implementation of GPT2 of OpenAI.
+
+`TrorYong` (ត្រយ៉ង) is Khmer word for giant ibis, the bird that symbolises __Cambodia__.
+
+## Support My Work
+
+While this work comes truly from the heart, each project represents a significant investment of time -- from deep-dive research and code preparation to the final narrative and editing process.
+I am incredibly passionate about sharing this knowledge, but maintaining this level of quality is a major undertaking.
+If you find my work helpful and are in a position to do so, please consider supporting my work with a donation.
+You can click <a href="https://pay.ababank.com/oRF8/8yp6hy53">here</a> to donate or scan the QR code below.
+Your generosity acts as a huge encouragement and helps ensure that I can continue creating in-depth, valuable content for you.
+
+<figure>
+  <div style="text-align: center;"><a name='slotMachine' ><img src="https://kimang18.github.io/assets/fig/aba_qr_kimang.JPG" width="500" /></a></div>
+  <figcaption> Using Cambodian bank account, you can donate by scanning my ABA QR code here. (or click <a href="https://pay.ababank.com/oRF8/8yp6hy53">here</a>. Make sure that receiver's name is 'Khun Kim Ang'.) </figcaption>
+</figure>
 
 # Installation
 
@@ -54,7 +69,14 @@ logits = model(torch_arr) # (B, T, n_vocab) = (1, 3, n_vocab)
 
 ## Train TrorYongGPT
 
-(To be done)
+You can check out the notebook below to train your own Small Language Model.
+I would like to highlight that you can __use your own tokenizer__ to train `TrorYongGPT` and I recommend to do so __for Khmer language__.
+
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Kimang18/rag-demo-with-mlx/blob/main/TrorYong_Small_Language_Model_from_Scratch.ipynb)
+
+I also have a video about training TrorYongGPT below
+
+[![Watch the video](https://i9.ytimg.com/vi/e7wEAVeIo0Y/mqdefault_custom_1.jpg?v=69569cdc&sqp=CKDR48oG&rs=AOn4CLCdBBobdPzfCVmrLvt4GHjR4w7EKA)](https://youtu.be/e7wEAVeIo0Y)
 
 ## Inference
 
@@ -86,5 +108,5 @@ print(result_text)
 
 ## TODO:
 - [X] implement model with KV cache `TrorYongGPT`
-- [ ] notebook colab for training `TrorYongGPT`
+- [X] notebook colab for training `TrorYongGPT`
 - [ ] benchmarking
