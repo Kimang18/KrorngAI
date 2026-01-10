@@ -80,11 +80,11 @@ __NOTE:__ When using __new__ tokenizer, you need to train the Text Decoder of yo
 You can check out the notebook below to train your own NeoWhisper.
 I would like to highlight that you can __use your own tokenizer__ as long as it is available in `tiktoken` pypi package to train `NeoWhisper` and I recommend to do so __for Khmer language__.
 
-[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Kimang18/rag-demo-with-mlx/blob/main/TrorYong_Small_Language_Model_from_Scratch.ipynb)
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Kimang18/rag-demo-with-mlx/blob/main/NeoWhisper_cl100k_Train.ipynb)
 
 I also have a video about training Text Decoder of NeoWhisper below
 
-[![Watch the video](https://i9.ytimg.com/vi/e7wEAVeIo0Y/mqdefault_custom_1.jpg?v=69569cdc&sqp=CKDR48oG&rs=AOn4CLCdBBobdPzfCVmrLvt4GHjR4w7EKA)](https://youtu.be/e7wEAVeIo0Y)
+[![Watch the video](https://i9.ytimg.com/vi/XJaqGjhiGxw/mqdefault_custom_2.jpg?v=695cba69&sqp=CJygissG&rs=AOn4CLBy8lcPmf0qJclnghZmfBIJim365w)](https://youtu.be/XJaqGjhiGxw)
 
 __Remark__
 
