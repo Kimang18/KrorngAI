@@ -111,8 +111,11 @@ class ResidualAttentionBlock(nn.Module):
         super().__init__()
 
         self.attn = CausalSelfAttention(layer_idx, n_state, n_head, n_kv_head)
+        self.ln1 = nn.RMSNorm(n_state)
         self.cross_attn = CrossMultiHeadAttention(n_state, n_head) if cross_attn else None
+        self.cross_ln = nn.RMSNorm(n_state)
         self.mlp = MLP(n_state)
+        self.ln2 = nn.RMSNorm(n_state)
 
     def forward(
         self,
@@ -122,10 +125,10 @@ class ResidualAttentionBlock(nn.Module):
         kv_cache: Optional[dict] = None,
     ):
         attn_kv_cache: KVCache = kv_cache['neo'] if kv_cache else None
-        x = x + self.attn(norm(x), cos_sin=cos_sin, kv_cache=attn_kv_cache)
+        x = x + self.attn(self.ln1(x), cos_sin=cos_sin, kv_cache=attn_kv_cache)
         if self.cross_attn:
-            x = x + self.cross_attn(norm(x), xa, cos_sin, kv_cache=kv_cache)[0]
-        x = x + self.mlp(norm(x))
+            x = x + self.cross_attn(self.cross_ln(x), xa, cos_sin, kv_cache=kv_cache)[0]
+        x = x + self.mlp(self.ln2(x))
         return x
 
 
@@ -142,6 +145,7 @@ class AudioEncoder(nn.Module):
                 for layer_idx in range(n_layer)
             ]
         )
+        self.ln_post = nn.RMSNorm(n_state)
         self.n_ctx = n_ctx
         self.rotary_aud_len = n_ctx
         head_dim = n_state // n_head
@@ -163,7 +167,8 @@ class AudioEncoder(nn.Module):
         for block in self.blocks:
             x = block(x, cos_sin=cos_sin, kv_cache=None)
 
-        x = norm(x)
+        # x = norm(x)
+        x = self.ln_post(x)
         return x
 
     def load_state_dict(self, state_dict: Dict[str, Tensor]):
@@ -213,6 +218,7 @@ class TextDecoder(nn.Module):
                 for layer_idx in range(n_layer)
             ]
         )
+        self.ln_f = nn.RMSNorm(n_state)
         self.lm_head = LinearWrapper(n_state, n_vocab, bias=False)
 
         self.rotary_seq_len = n_ctx * 10
@@ -272,7 +278,7 @@ class TextDecoder(nn.Module):
 
         for block in self.blocks:
             x = block(x, xa, cos_sin=cos_sin, kv_cache=kv_cache)
-        x = norm(x)
+        x = self.ln_f(x)
 
         logits = self.lm_head(x)
 
