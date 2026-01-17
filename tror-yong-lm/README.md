@@ -76,7 +76,7 @@ I would like to highlight that you can __use your own tokenizer__ to train `Tror
 
 I also have a video about training TrorYongGPT below
 
-[![Watch the video](https://i9.ytimg.com/vi/e7wEAVeIo0Y/mqdefault_custom_1.jpg?v=69569cdc&sqp=CKDR48oG&rs=AOn4CLCdBBobdPzfCVmrLvt4GHjR4w7EKA)](https://youtu.be/e7wEAVeIo0Y)
+[![Watch the video](https://i9.ytimg.com/vi/e7wEAVeIo0Y/mqdefault_custom_1.jpg?v=69569cdc&sqp=CNjorssG&rs=AOn4CLC7rnplNZJUDmBvKJrGz3tKW_W_Yw)](https://youtu.be/e7wEAVeIo0Y)
 
 ## Inference
 
