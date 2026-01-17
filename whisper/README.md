@@ -39,7 +39,7 @@ print(tokenizer.eot)
 from neo_whisper import NeoWhisper, NeoModelDimensions
 dims = NeoModelDimensions(
     n_vocab=tokenizer.encoding.n_vocab, # use the tokenizer's vocab size
-    n_mels=80,       # or whatever context size you're training with
+    n_mels=80,
     n_audio_ctx=1500,
     n_audio_state=384,
     n_audio_head=6,
@@ -53,7 +53,7 @@ dims = NeoModelDimensions(
 model = NeoWhisper(dims)
 ```
 
-This `model` works like the original model of OpenAI whisper (`NeoWhisper` inherits from `Whisper` of openai-whisper. TextDecoder of `NeoWhisper` is different from the one of `Whisper` in the sense that `RoPE` is integrated in `NeoWhisper`.).
+This `model` works like the original model of OpenAI whisper (actually, `NeoWhisper` inherits from `Whisper` of openai-whisper. TextDecoder of `NeoWhisper` is different from the one of `Whisper` in the sense that `RoPE` is integrated in `NeoWhisper`.).
 
 ## Loading Original Whisper model
 It is possible to load the model implemented in openai-whisper but with new tokenizer (such as `cl100k_base`).
@@ -61,7 +61,7 @@ It is possible to load the model implemented in openai-whisper but with new toke
 from neo_whisper import Whisper, ModelDimensions
 dims = ModelDimensions(
     n_vocab=tokenizer.encoding.n_vocab, # use the tokenizer's vocab size
-    n_mels=80,       # or whatever context size you're training with
+    n_mels=80,
     n_audio_ctx=1500,
     n_audio_state=384,
     n_audio_head=6,
@@ -84,11 +84,11 @@ I would like to highlight that you can __use your own tokenizer__ as long as it 
 
 I also have a video about training Text Decoder of NeoWhisper below
 
-[![Watch the video](https://i9.ytimg.com/vi/XJaqGjhiGxw/mqdefault_custom_2.jpg?v=695cba69&sqp=CJygissG&rs=AOn4CLBy8lcPmf0qJclnghZmfBIJim365w)](https://youtu.be/XJaqGjhiGxw)
+[![Watch the video](https://i9.ytimg.com/vi/XJaqGjhiGxw/mqdefault_custom_1.jpg?v=695cba69&sqp=CKzmrssG&rs=AOn4CLBqb67cmTkxK2vhaHgxwjTXhI00nQ)](https://youtu.be/XJaqGjhiGxw)
 
 __Remark__
 
-When the config of `AudioEncoder` is the same as the original whisper audio encoder trained by OpenAI, we can load pre-trained weight for the encoder and just train the text decoder.
+When the config of `AudioEncoder` is the same as the original whisper audio encoder trained by OpenAI, we can load pre-trained weight for the encoder from OpenAI, and just train the text decoder.
 To load model with `AudioEncoder` of OpenAI whisper, simply provide `neo_encoder=False` when initialize `NeoWhisper` (by default, `neo_encoder=True`).
 
 ```python
@@ -97,7 +97,7 @@ import whisper
 
 dims = NeoModelDimensions(
     n_vocab=tokenizer.encoding.n_vocab, # use the tokenizer's vocab size
-    n_mels=80,       # or whatever context size you're training with
+    n_mels=80,
     n_audio_ctx=1500,
     n_audio_state=384,
     n_audio_head=6,
