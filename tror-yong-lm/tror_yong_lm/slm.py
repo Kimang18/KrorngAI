@@ -52,7 +52,9 @@ class ResidualAttentionBlock(nn.Module):
     def __init__(self, layer_idx: int, n_state: int, n_head: int, n_kv_head: int):
         super().__init__()
         self.attn = CausalSelfAttention(layer_idx, n_state, n_head, n_kv_head)
+        self.ln1 = nn.RMSNorm(n_state)
         self.mlp = MLP(n_state)
+        self.ln2 = nn.RMSNorm(n_state)
 
     def forward(
         self,
@@ -60,8 +62,10 @@ class ResidualAttentionBlock(nn.Module):
         cos_sin=None,
         kv_cache: Optional[KVCache] = None,
     ) -> Tensor:
-        x = x + self.attn(norm(x), cos_sin=cos_sin, kv_cache=kv_cache)
-        x = x + self.mlp(norm(x))
+        # x = x + self.attn(norm(x), cos_sin=cos_sin, kv_cache=kv_cache)
+        # x = x + self.mlp(norm(x))
+        x = x + self.attn(self.ln1(x), cos_sin=cos_sin, kv_cache=kv_cache)
+        x = x + self.mlp(self.ln2(x))
         return x
 
 
@@ -77,6 +81,7 @@ class TrorYongGPT(nn.Module):
                 for layer_idx in range(config.n_layer)
             ]
         )
+        self.ln_f = nn.RMSNorm(config.n_state)
         self.lm_head = LinearWrapper(config.n_state, config.n_vocab, bias=False)
 
         self.rotary_seq_len = config.n_ctx * 10
@@ -133,7 +138,8 @@ class TrorYongGPT(nn.Module):
         x = norm(x)
         for block in self.blocks:
             x = block(x, cos_sin=cos_sin, kv_cache=kv_cache)
-        x = norm(x)
+        # x = norm(x)
+        x = self.ln_f(x)
 
         logits = self.lm_head(x)
         logits = logits.float()
