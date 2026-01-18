@@ -34,10 +34,13 @@ class MLP(nn.Module):
         super().__init__()
         self.c_fc = LinearWrapper(n_state, 4 * n_state)
         self.c_proj = LinearWrapper(4 * n_state, n_state)
+        self.up_proj = LinearWrapper(n_state, 4 * n_state)
 
     def forward(self, x):
+        x_up = self.up_proj(x)
         x = self.c_fc(x)
-        x = F.relu(x).square()
+        # x = F.relu(x).square() * x_up
+        x = F.gelu(x, approximate="tanh") * x_up
         return self.c_proj(x)
 
 
@@ -51,10 +54,12 @@ class ResidualAttentionBlock(nn.Module):
 
     def __init__(self, layer_idx: int, n_state: int, n_head: int, n_kv_head: int):
         super().__init__()
+        self.pre_ln1 = nn.RMSNorm(n_state)
         self.attn = CausalSelfAttention(layer_idx, n_state, n_head, n_kv_head)
-        self.ln1 = nn.RMSNorm(n_state)
+        self.post_ln1 = nn.RMSNorm(n_state)
+        self.pre_ln2 = nn.RMSNorm(n_state)
         self.mlp = MLP(n_state)
-        self.ln2 = nn.RMSNorm(n_state)
+        self.post_ln2 = nn.RMSNorm(n_state)
 
     def forward(
         self,
@@ -62,10 +67,8 @@ class ResidualAttentionBlock(nn.Module):
         cos_sin=None,
         kv_cache: Optional[KVCache] = None,
     ) -> Tensor:
-        # x = x + self.attn(norm(x), cos_sin=cos_sin, kv_cache=kv_cache)
-        # x = x + self.mlp(norm(x))
-        x = x + self.attn(self.ln1(x), cos_sin=cos_sin, kv_cache=kv_cache)
-        x = x + self.mlp(self.ln2(x))
+        x = x + self.post_ln1(self.attn(self.pre_ln1(x), cos_sin=cos_sin, kv_cache=kv_cache))
+        x = x + self.post_ln2(self.mlp(self.pre_ln2(x)))
         return x
 
 
@@ -135,17 +138,15 @@ class TrorYongGPT(nn.Module):
         cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T]
 
         x = self.token_embedding(x)
-        x = norm(x)
         for block in self.blocks:
             x = block(x, cos_sin=cos_sin, kv_cache=kv_cache)
-        # x = norm(x)
         x = self.ln_f(x)
 
         logits = self.lm_head(x)
         logits = logits.float()
 
-        softcap = 15
-        logits = softcap * torch.tanh(logits / softcap)
+        # softcap = 15
+        # logits = softcap * torch.tanh(logits / softcap)
         return logits
 
     @property
