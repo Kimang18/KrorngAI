@@ -26,10 +26,12 @@ from .nn_utils import (
     precompute_rotary_emb,
     norm,
     apply_rotary_emb,
+    RMSNormWrapper,
     LinearWrapper,
     Conv1dWrapper,
     KVCache,
-    CausalSelfAttention
+    CausalSelfAttention,
+    MLP
 )
 from .common import print_banner
 
@@ -88,18 +90,6 @@ class CrossMultiHeadAttention(MultiHeadAttention):
         return self.out(out), qk
 
 
-class MLP(nn.Module):
-    def __init__(self, n_state: int):
-        super().__init__()
-        self.c_fc = LinearWrapper(n_state, 4 * n_state)
-        self.c_proj = LinearWrapper(4 * n_state, n_state)
-
-    def forward(self, x):
-        x = self.c_fc(x)
-        x = F.relu(x).square()
-        return self.c_proj(x)
-
-
 class ResidualAttentionBlock(nn.Module):
     """
     Attention block for text decoder
@@ -111,11 +101,11 @@ class ResidualAttentionBlock(nn.Module):
         super().__init__()
 
         self.attn = CausalSelfAttention(layer_idx, n_state, n_head, n_kv_head)
-        self.ln1 = nn.RMSNorm(n_state)
+        self.ln1 = RMSNormWrapper(n_state)
         self.cross_attn = CrossMultiHeadAttention(n_state, n_head) if cross_attn else None
-        self.cross_ln = nn.RMSNorm(n_state)
+        self.cross_ln = RMSNormWrapper(n_state) if cross_attn else None
         self.mlp = MLP(n_state)
-        self.ln2 = nn.RMSNorm(n_state)
+        self.ln2 = RMSNormWrapper(n_state)
 
     def forward(
         self,
@@ -145,7 +135,7 @@ class AudioEncoder(nn.Module):
                 for layer_idx in range(n_layer)
             ]
         )
-        self.ln_post = nn.RMSNorm(n_state)
+        self.ln_post = RMSNormWrapper(n_state)
         self.n_ctx = n_ctx
         self.rotary_aud_len = n_ctx
         head_dim = n_state // n_head
@@ -218,7 +208,7 @@ class TextDecoder(nn.Module):
                 for layer_idx in range(n_layer)
             ]
         )
-        self.ln_f = nn.RMSNorm(n_state)
+        self.ln_f = RMSNormWrapper(n_state)
         self.lm_head = LinearWrapper(n_state, n_vocab, bias=False)
 
         self.rotary_seq_len = n_ctx * 10
@@ -283,8 +273,6 @@ class TextDecoder(nn.Module):
         logits = self.lm_head(x)
 
         logits = logits.float()
-        softcap = 15
-        logits = softcap * torch.tanh(logits / softcap)
 
         return logits
 

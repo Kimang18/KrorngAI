@@ -10,10 +10,11 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from .nn_utils import (
-    norm,
     LinearWrapper,
     KVCache,
     CausalSelfAttention,
+    MLP,
+    RMSNormWrapper,
     precompute_rotary_emb
 )
 from .common import print_banner
@@ -29,21 +30,6 @@ class TrorYongConfig:
     n_layer: int
 
 
-class MLP(nn.Module):
-    def __init__(self, n_state: int):
-        super().__init__()
-        self.c_fc = LinearWrapper(n_state, 4 * n_state)
-        self.c_proj = LinearWrapper(4 * n_state, n_state)
-        self.up_proj = LinearWrapper(n_state, 4 * n_state)
-
-    def forward(self, x):
-        x_up = self.up_proj(x)
-        x = self.c_fc(x)
-        # x = F.relu(x).square() * x_up
-        x = F.gelu(x, approximate="tanh") * x_up
-        return self.c_proj(x)
-
-
 class ResidualAttentionBlock(nn.Module):
     """
     Attention block for text decoder
@@ -54,12 +40,12 @@ class ResidualAttentionBlock(nn.Module):
 
     def __init__(self, layer_idx: int, n_state: int, n_head: int, n_kv_head: int):
         super().__init__()
-        self.pre_ln1 = nn.RMSNorm(n_state)
+        self.pre_ln1 = RMSNormWrapper(n_state)
         self.attn = CausalSelfAttention(layer_idx, n_state, n_head, n_kv_head)
-        self.post_ln1 = nn.RMSNorm(n_state)
-        self.pre_ln2 = nn.RMSNorm(n_state)
+        self.post_ln1 = RMSNormWrapper(n_state)
+        self.pre_ln2 = RMSNormWrapper(n_state)
         self.mlp = MLP(n_state)
-        self.post_ln2 = nn.RMSNorm(n_state)
+        self.post_ln2 = RMSNormWrapper(n_state)
 
     def forward(
         self,
@@ -84,7 +70,7 @@ class TrorYongGPT(nn.Module):
                 for layer_idx in range(config.n_layer)
             ]
         )
-        self.ln_f = nn.RMSNorm(config.n_state)
+        self.ln_f = RMSNormWrapper(config.n_state)
         self.lm_head = LinearWrapper(config.n_state, config.n_vocab, bias=False)
 
         self.rotary_seq_len = config.n_ctx * 10
@@ -145,8 +131,6 @@ class TrorYongGPT(nn.Module):
         logits = self.lm_head(x)
         logits = logits.float()
 
-        # softcap = 15
-        # logits = softcap * torch.tanh(logits / softcap)
         return logits
 
     @property

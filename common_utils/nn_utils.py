@@ -48,6 +48,11 @@ class LayerNormWrapper(nn.LayerNorm):
         return super().forward(x.float()).type(x.dtype)
 
 
+class RMSNormWrapper(nn.RMSNorm):
+    def forward(self, x: Tensor) -> Tensor:
+        return super().forward(x.float()).type(x.dtype)
+
+
 class Conv1dWrapper(nn.Conv1d):
     def _conv_forward(
         self, x: Tensor, weight: Tensor, bias: Optional[Tensor]
@@ -163,6 +168,21 @@ class KVCache:
         if layer_idx == self.kv_cache.size(0) - 1:
             self.pos = t1
         return key_view, value_view
+
+
+class MLP(nn.Module):
+    def __init__(self, n_state: int):
+        super().__init__()
+        self.c_fc = LinearWrapper(n_state, 4 * n_state)
+        self.c_proj = LinearWrapper(4 * n_state, n_state)
+        self.up_proj = LinearWrapper(n_state, 4 * n_state)
+
+    def forward(self, x):
+        x_up = self.up_proj(x)
+        x = self.c_fc(x)
+        # x = F.relu(x).square() * x_up
+        x = F.gelu(x, approximate="tanh") * x_up
+        return self.c_proj(x)
 
 
 class CausalSelfAttention(nn.Module):
