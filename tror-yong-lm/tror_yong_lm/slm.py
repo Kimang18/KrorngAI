@@ -28,6 +28,7 @@ class TrorYongConfig:
     n_head: int
     n_kv_head: int
     n_layer: int
+    dropout: float = 0.0
 
 
 class ResidualAttentionBlock(nn.Module):
@@ -38,13 +39,14 @@ class ResidualAttentionBlock(nn.Module):
     To avoid complication, I fallback to original MultiHeadAttention of whisper package for cross attention
     """
 
-    def __init__(self, layer_idx: int, n_state: int, n_head: int, n_kv_head: int):
+    def __init__(self, layer_idx: int, n_state: int, n_head: int, n_kv_head: int, dropout: float = 0.0):
         super().__init__()
         self.pre_ln1 = RMSNormWrapper(n_state)
         self.attn = CausalSelfAttention(layer_idx, n_state, n_head, n_kv_head)
         self.post_ln1 = RMSNormWrapper(n_state)
+        self.dropout = nn.Dropout(dropout)
         self.pre_ln2 = RMSNormWrapper(n_state)
-        self.mlp = MLP(n_state)
+        self.mlp = MLP(n_state, dropout)
         self.post_ln2 = RMSNormWrapper(n_state)
 
     def forward(
@@ -53,7 +55,7 @@ class ResidualAttentionBlock(nn.Module):
         cos_sin=None,
         kv_cache: Optional[KVCache] = None,
     ) -> Tensor:
-        x = x + self.post_ln1(self.attn(self.pre_ln1(x), cos_sin=cos_sin, kv_cache=kv_cache))
+        x = x + self.dropout(self.post_ln1(self.attn(self.pre_ln1(x), cos_sin=cos_sin, kv_cache=kv_cache)))
         x = x + self.post_ln2(self.mlp(self.pre_ln2(x)))
         return x
 
@@ -64,9 +66,10 @@ class TrorYongGPT(nn.Module):
         self.config = config
 
         self.token_embedding = nn.Embedding(config.n_vocab, config.n_state)
+        self.dropout = nn.Dropout(config.dropout)
         self.blocks: Iterable[ResidualAttentionBlock] = nn.ModuleList(
             [
-                ResidualAttentionBlock(layer_idx, config.n_state, config.n_head, config.n_kv_head)
+                ResidualAttentionBlock(layer_idx, config.n_state, config.n_head, config.n_kv_head, config.dropout)
                 for layer_idx in range(config.n_layer)
             ]
         )
@@ -123,7 +126,7 @@ class TrorYongGPT(nn.Module):
         T0 = kv_cache.get_pos() if kv_cache else 0
         cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T]
 
-        x = self.token_embedding(x)
+        x = self.dropout(self.token_embedding(x))
         for block in self.blocks:
             x = block(x, cos_sin=cos_sin, kv_cache=kv_cache)
         x = self.ln_f(x)

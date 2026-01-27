@@ -171,17 +171,20 @@ class KVCache:
 
 
 class MLP(nn.Module):
-    def __init__(self, n_state: int):
+    def __init__(self, n_state: int, dropout: float = 0.0):
         super().__init__()
         self.c_fc = LinearWrapper(n_state, 4 * n_state)
-        self.c_proj = LinearWrapper(4 * n_state, n_state)
         self.up_proj = LinearWrapper(n_state, 4 * n_state)
+        self.c_proj = LinearWrapper(4 * n_state, n_state)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         x_up = self.up_proj(x)
         x = self.c_fc(x)
+        x = x * torch.sigmoid(x)
         # x = F.relu(x).square() * x_up
-        x = F.gelu(x, approximate="tanh") * x_up
+        # x = F.gelu(x, approximate="tanh") * x_up
+        x = x * x_up
         return self.c_proj(x)
 
 

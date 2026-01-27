@@ -39,6 +39,9 @@ from .common import print_banner
 @dataclass
 class NeoModelDimensions(ModelDimensions):
     n_text_kv_head: int
+    dropout: float = 0.0
+
+#TODO: consider adding bias when appropriate
 
 
 class CrossMultiHeadAttention(MultiHeadAttention):
@@ -97,14 +100,16 @@ class ResidualAttentionBlock(nn.Module):
     For cross-attention, I apply rotary sequence embedding on query only
     """
 
-    def __init__(self, layer_idx: int, n_state: int, n_head: int, n_kv_head: int, cross_attn: bool=False):
+    def __init__(self, layer_idx: int, n_state: int, n_head: int, n_kv_head: int, dropout: float = 0.0, cross_attn: bool=False):
         super().__init__()
 
         self.attn = CausalSelfAttention(layer_idx, n_state, n_head, n_kv_head)
         self.ln1 = RMSNormWrapper(n_state)
+        self.dropout = nn.Dropout(dropout)
         self.cross_attn = CrossMultiHeadAttention(n_state, n_head) if cross_attn else None
         self.cross_ln = RMSNormWrapper(n_state) if cross_attn else None
-        self.mlp = MLP(n_state)
+        self.cross_dropout = nn.Dropout(dropout)
+        self.mlp = MLP(n_state, dropout)
         self.ln2 = RMSNormWrapper(n_state)
 
     def forward(
@@ -115,9 +120,9 @@ class ResidualAttentionBlock(nn.Module):
         kv_cache: Optional[dict] = None,
     ):
         attn_kv_cache: KVCache = kv_cache['neo'] if kv_cache else None
-        x = x + self.attn(self.ln1(x), cos_sin=cos_sin, kv_cache=attn_kv_cache)
+        x = x + self.dropout(self.attn(self.ln1(x), cos_sin=cos_sin, kv_cache=attn_kv_cache))
         if self.cross_attn:
-            x = x + self.cross_attn(self.cross_ln(x), xa, cos_sin, kv_cache=kv_cache)[0]
+            x = x + self.cross_dropout(self.cross_attn(self.cross_ln(x), xa, cos_sin, kv_cache=kv_cache)[0])
         x = x + self.mlp(self.ln2(x))
         return x
 
@@ -194,7 +199,7 @@ class AudioEncoder(nn.Module):
 
 class TextDecoder(nn.Module):
     def __init__(
-        self, n_vocab: int, n_ctx: int, n_state: int, n_head: int, n_layer: int
+        self, n_vocab: int, n_ctx: int, n_state: int, n_head: int, n_layer: int, dropout: float = 0.0
     ):
         super().__init__()
 
@@ -202,9 +207,10 @@ class TextDecoder(nn.Module):
         self.n_head = n_head
 
         self.token_embedding = nn.Embedding(n_vocab, n_state)
+        self.dropout = nn.Dropout(dropout)
         self.blocks: Iterable[ResidualAttentionBlock] = nn.ModuleList(
             [
-                ResidualAttentionBlock(layer_idx, n_state, n_head, n_head, cross_attn=True)
+                ResidualAttentionBlock(layer_idx, n_state, n_head, n_head, dropout=dropout, cross_attn=True)
                 for layer_idx in range(n_layer)
             ]
         )
@@ -263,7 +269,7 @@ class TextDecoder(nn.Module):
         T0 = kv_cache['neo'].get_pos() if kv_cache else 0
         cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T]
 
-        x = self.token_embedding(x)  # (B, T, n_state)
+        x = self.dropout(self.token_embedding(x))  # (B, T, n_state)
         x = x.to(xa.dtype)
 
         for block in self.blocks:
@@ -302,6 +308,7 @@ class NeoWhisper(Whisper):
             self.dims.n_text_state,
             self.dims.n_text_head,
             self.dims.n_text_layer,
+            self.dims.dropout
         )
         self.decoder.init_weights()
         if verbose:
