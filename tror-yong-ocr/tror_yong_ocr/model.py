@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from .tokenizer import get_tokenizer
 
 
 def norm(x):
@@ -253,6 +254,26 @@ class TrorYongOCR(nn.Module):
         else:
             # inference mode
             return self.lm_head(norm(query[:, [-1], :])).float(), None
+
+    @classmethod
+    def from_pretrained(cls):
+        tokenizer = get_tokenizer()
+        config = TrorYongConfig(
+            img_size=(32, 128),
+            patch_size=(4, 8),
+            n_channel=3,
+            vocab_size=len(tokenizer), # exclude pad and unk tokens
+            block_size=192,
+            n_layer=4,
+            n_head=6,
+            n_embed=384,
+            dropout=0.1,
+            bias=True,
+        )
+        model = cls(config, tokenizer)
+        state_dict = torch.hub.load_state_dict_from_url('https://huggingface.co/KrorngAI/PARSeqForKhmer/resolve/main/best_model-80epoch.pt', map_location=torch.device('cpu'))
+        model.load_state_dict(state_dict)
+        return model
 
     @torch.inference_mode()
     def decode(self, img_tensor: Tensor, max_tokens: int, temperature=1.0, top_k=None):
