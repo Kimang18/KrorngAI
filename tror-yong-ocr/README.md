@@ -69,7 +69,7 @@ Inspired by [`PARSeq`](https://github.com/baudm/parseq/tree/main) and [`DTrOCR`]
 The architecture of TrorYongOCR can be found in Figure 1 below.
 
 <figure>
-  <div style="text-align: center;"><a name='slotMachine' ><img src="./TrorYongOCR.drawio.png" width="500" /></a></div>
+  <div style="text-align: center;"><a name='slotMachine' ><img src="https://raw.githubusercontent.com/Kimang18/KrorngAI/refs/heads/main/tror-yong-ocr/TrorYongOCR.drawio.png" width="500" /></a></div>
   <figcaption> Figure 1: TrorYongOCR architecture overview. The input image is transformed into patch embedding. Image embedding is obtained by additioning patch embedding and position embedding. The image embedding is passed through L-1 encoder blocks to generate image encoding (latent state). The image encoding is concatenated with character embedding (i.e. token embedding plus position embedding) before undergoing causal self-attention mechanism in the single decoder block to generate next token.</figcaption>
 </figure>
 
