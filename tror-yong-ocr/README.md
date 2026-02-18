@@ -66,6 +66,12 @@ Inspired by [`PARSeq`](https://github.com/baudm/parseq/tree/main) and [`DTrOCR`]
   - the __latent state__ of an image (the output of encoding layers) is concatenated with the __input character embedding__ (token embedding including `bos` token plus position embedding) to create __context vector__, _i.e._ __key and value vectors__ (think of it like a prompt prefill)
   - and the __input character embedding__ (token embedding plus position embedding) is used as __query vector__.
 
+The architecture of TrorYongOCR can be found in Figure 1 below.
+
+<figure>
+  <div style="text-align: center;"><a name='slotMachine' ><img src="./TrorYongOCR.drawio.png" width="500" /></a></div>
+  <figcaption> Figure 1: TrorYongOCR architecture overview. The input image is transformed into patch embedding. Image embedding is obtained by additioning patch embedding and position embedding. The image embedding is passed through L-1 encoder blocks to generate image encoding (latent state). The image encoding is concatenated with character embedding (i.e. token embedding plus position embedding) before undergoing causal self-attention mechanism in the single decoder block to generate next token.</figcaption>
+</figure>
 
 New technologies in Attention mechanism such as Rotary Positional Embedding (RoPE), and Sigmoid Linear Unit (SiLU) and Gated Linear Unit (GLU) in MLP of Transformer block are implemented in TrorYongOCR.
 
