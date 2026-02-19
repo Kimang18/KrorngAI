@@ -165,17 +165,17 @@ class ResidualAttentionBlock(nn.Module):
         self.mha = MultiheadAttention(d_model, nhead, dropout=dropout, bias=bias)
         self.ffn = FeedForward(d_model, dim_feedforward, dropout, bias)
 
-    def forward(self, x, img_emb=None, src_mask=None, cos_sin=None, kv_cache=None):
+    def forward(self, x, img_enc=None, src_mask=None, cos_sin=None, kv_cache=None):
         """
         x: query/hidden state (b, L, n_embed)
-        img_emb: image token already normalized (b, n_patch, n_embed)
+        img_enc: image encoding (b, n_patch, n_embed)
         src_mask: attention mask (L, n_patch + L)
         """
         x_norm = norm(x)
-        if img_emb is None:
+        if img_enc is None:
             memory = x_norm
         else:
-            memory = torch.cat([norm(img_emb), x_norm], dim=1)
+            memory = torch.cat([norm(img_enc), x_norm], dim=1)
 
         x = x + self.mha(x_norm, memory, memory, src_mask, cos_sin, kv_cache)[0]
         x = x + self.ffn(norm(x))
@@ -229,7 +229,7 @@ class TrorYongOCR(nn.Module):
 
     def forward(self, img, x, targets=None):
         """
-        x including bos and eos => need to mask eos token in attention mechanism
+        x including bos
         img image tensor (b, 3, 32, 128)
         """
         b, L = x.size()
@@ -241,11 +241,11 @@ class TrorYongOCR(nn.Module):
 
         # decoding layer
         S = self.n_patch + L
-        # all character tokens must communicate with all image tokens
+        # all character tokens must communicate with all image encoding
         mask = self.mask[self.n_patch:self.n_patch + L, :S]
 
         query = self.dropout(self.tok_embed(x) + self.pos_embed[:, :L])
-        query = self.txt_decoder(query, img_emb=img_emb, src_mask=mask)
+        query = self.txt_decoder(query, img_enc=img_emb, src_mask=mask)
         if targets is not None:
             query = norm(query)
             logits = self.lm_head(query).float() # (b, L, n_vocab)
@@ -297,7 +297,7 @@ class TrorYongOCR(nn.Module):
             mask = self.mask[self.n_patch + i-1:self.n_patch + i, :self.n_patch + i]
             if i == 1:
                 query = self.dropout(self.tok_embed(idx) + self.pos_embed[:, i-1:i])
-                query = self.txt_decoder(query, img_emb=img_emb, src_mask=mask, kv_cache=kv_cache)
+                query = self.txt_decoder(query, img_enc=img_emb, src_mask=mask, kv_cache=kv_cache)
             else:
                 query = self.dropout(self.tok_embed(idx_next) + self.pos_embed[:, i-1:i])
                 query = self.txt_decoder(query, src_mask=mask, kv_cache=kv_cache)
