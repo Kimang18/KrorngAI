@@ -271,7 +271,7 @@ class TrorYongOCR(nn.Module):
             bias=True,
         )
         model = cls(config, tokenizer)
-        state_dict = torch.hub.load_state_dict_from_url('https://huggingface.co/KrorngAI/PARSeqForKhmer/resolve/main/best_model-80epoch.pt', map_location=torch.device('cpu'))
+        state_dict = torch.hub.load_state_dict_from_url('https://huggingface.co/KrorngAI/PARSeqForKhmer/resolve/main/best_model-90epoch.pt', map_location=torch.device('cpu'))
         model.load_state_dict(state_dict)
         return model
 
