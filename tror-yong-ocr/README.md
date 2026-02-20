@@ -108,7 +108,7 @@ model = TrorYongOCR(config, tokenizer)
 
 You can check out the notebook below to train your own Small OCR Model.
 
-[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Kimang18/rag-demo-with-mlx/blob/main/https://colab.research.google.com/github/Kimang18/rag-demo-with-mlx/blob/main/FinetuneTrorYongOCR.ipynb)
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Kimang18/SourceCode-KrorngAI-YT/blob/main/FinetuneTrorYongOCR.ipynb)
 
 I also have a video about training TrorYongOCR below
 
