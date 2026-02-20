@@ -43,7 +43,8 @@ try:
         ]
     )
 finally:
-    for script in ["nn_utils.py", "common.py"]:
-        common_script_dest = os.path.join(str(package_dir), script)
-        if os.path.exists(common_script_dest):
-            os.remove(common_script_dest)
+    # for script in ["nn_utils.py", "common.py"]:
+    #     common_script_dest = os.path.join(str(package_dir), script)
+    #     if os.path.exists(common_script_dest):
+    #         os.remove(common_script_dest)
+    pass
