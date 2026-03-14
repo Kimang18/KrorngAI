@@ -3,6 +3,7 @@
 
 
 from typing import List, Optional
+import regex as re
 
 try:
     from whisper.tokenizer import (
@@ -29,15 +30,61 @@ class NeoTokenizer(Tokenizer):
         return self.encoding.decode(token_ids, **kwargs)
 
 
+def is_english_or_khmer(token_bytes: bytes, allowed_pattern) -> bool:
+    try:
+        # Step 1: Decode bytes to UTF-8 string
+        text = token_bytes.decode('utf-8')
+
+        # Step 2: Use fullmatch to ensure EVERY character in the token
+        # belongs to the allowed ranges
+        return bool(allowed_pattern.fullmatch(text))
+
+    except UnicodeDecodeError:
+        # If it can't be decoded as UTF-8, they cannot be checked by regex.
+        # We return False here; the main loop will still keep these
+        # if they are single bytes (len == 1) for safety.
+        return False
+
+
 @lru_cache(maxsize=None)
 def get_encoding(name: str = "gpt2", num_languages: int = 99):
     """
     Inspired by https://github.com/openai/tiktoken/tree/main, Section Extending tiktoken
     And tokenizer.py of OpenAI/whisper
     """
-    encoder_decoder = tiktoken.get_encoding(name)
+    if name == "km-en":
+        encoder_decoder = tiktoken.get_encoding("o200k_base")
+        original_ranks: dict[bytes, int] = encoder_decoder._mergeable_ranks
+        # filter for Khmer and English tokens
+        # around 130000 tokens remain
 
-    n_vocab = len(encoder_decoder._mergeable_ranks)
+        # Unicode ranges:
+        # English/Basic Latin: 0x0000-0x007F
+        # Khmer: 0x1780-0x17FF
+        # Khmer Symbols: 0x19E0-0x19FF
+        allowed = re.compile(
+            r'^[\u0000-\u007F'
+            r'\u1780-\u17FF'
+            r'\u19E0-\u19FF]+$'
+        )
+        subset_ranks = {}
+        for token, rank in original_ranks.items():
+            if len(token) == 1:   # Always keep single bytes (the 256 'atoms')
+                subset_ranks[token] = rank
+                continue
+
+            if is_english_or_khmer(token, allowed):
+                subset_ranks[token] = rank
+
+        # Re-index: Create a new mapping from token bytes to a new contiguous ID
+        # We sort by the original rank to maintain the BPE merge priority order
+        sorted_ranks = sorted(subset_ranks, key=lambda t: original_ranks[t])
+        mergeable_ranks = {token: i for i, token in enumerate(sorted_ranks)}
+    else:
+        encoder_decoder = tiktoken.get_encoding(name)
+        mergeable_ranks = encoder_decoder._mergeable_ranks
+
+    n_vocab = len(mergeable_ranks)
     special_tokens = {}
 
     specials = [
@@ -61,7 +108,7 @@ def get_encoding(name: str = "gpt2", num_languages: int = 99):
         name=f"{name}_im",
         explicit_n_vocab=n_vocab,
         pat_str=encoder_decoder._pat_str,
-        mergeable_ranks=encoder_decoder._mergeable_ranks,
+        mergeable_ranks=mergeable_ranks,
         special_tokens=special_tokens,
     )
 
