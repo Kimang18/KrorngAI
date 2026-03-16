@@ -42,9 +42,8 @@ class ResidualAttentionBlock(nn.Module):
     def __init__(self, layer_idx: int, n_state: int, n_head: int, n_kv_head: int, dropout: float = 0.0):
         super().__init__()
         self.pre_ln1 = RMSNormWrapper(n_state)
-        self.attn = CausalSelfAttention(layer_idx, n_state, n_head, n_kv_head)
+        self.attn = CausalSelfAttention(layer_idx, n_state, n_head, n_kv_head, dropout)
         self.post_ln1 = RMSNormWrapper(n_state)
-        self.dropout = nn.Dropout(dropout)
         self.pre_ln2 = RMSNormWrapper(n_state)
         self.mlp = MLP(n_state, dropout)
         self.post_ln2 = RMSNormWrapper(n_state)
@@ -55,7 +54,7 @@ class ResidualAttentionBlock(nn.Module):
         cos_sin=None,
         kv_cache: Optional[KVCache] = None,
     ) -> Tensor:
-        x = x + self.dropout(self.post_ln1(self.attn(self.pre_ln1(x), cos_sin=cos_sin, kv_cache=kv_cache)))
+        x = x + self.post_ln1(self.attn(self.pre_ln1(x), cos_sin=cos_sin, kv_cache=kv_cache))
         x = x + self.post_ln2(self.mlp(self.pre_ln2(x)))
         return x
 
@@ -132,7 +131,6 @@ class TrorYongGPT(nn.Module):
         x = self.ln_f(x)
 
         logits = self.lm_head(x)
-        logits = logits.float()
 
         return logits
 
