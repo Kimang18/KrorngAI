@@ -180,16 +180,15 @@ class MLP(nn.Module):
 
     def forward(self, x):
         x_up = self.up_proj(x)
-        x = self.c_fc(x)
-        x = x * torch.sigmoid(x)
+        x = F.silu(self.c_fc(x))
         # x = F.relu(x).square() * x_up
         # x = F.gelu(x, approximate="tanh") * x_up
         x = x * x_up
-        return self.c_proj(x)
+        return self.dropout(self.c_proj(x))
 
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, layer_idx: int, n_state: int, n_head: int, n_kv_head: int):
+    def __init__(self, layer_idx: int, n_state: int, n_head: int, n_kv_head: int, dropout: float=0.0):
         super().__init__()
         assert n_state % n_head == 0
         assert n_kv_head <= n_head and n_head % n_kv_head == 0
@@ -203,6 +202,7 @@ class CausalSelfAttention(nn.Module):
         self.key = LinearWrapper(self.n_state, self.n_kv_head * self.head_dim, bias=False)
         self.value = LinearWrapper(self.n_state, self.n_kv_head * self.head_dim)
         self.out = LinearWrapper(self.n_state, self.n_state)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(
         self,
@@ -232,11 +232,11 @@ class CausalSelfAttention(nn.Module):
         if kv_cache is None or Tq == Tk:
             # During training (no KV cache), attend as usual with causal attention
             # And even if there is KV cache, we can still use this simple version when Tq == Tk
-            a = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=enable_gqa)
+            a = F.scaled_dot_product_attention(q, k, v, dropout_p=self.dropout.p, is_causal=True, enable_gqa=enable_gqa)
         elif Tq == 1:
             # During inference but with a single query in this forward pass:
             # The query has to attend to all the key/values in the cache
-            a = F.scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=enable_gqa)
+            a = F.scaled_dot_product_attention(q, k, v, dropout_p=self.dropout.p, is_causal=False, enable_gqa=enable_gqa)
         else:
             # During inference AND we have a chunk of queries in this forward pass:
             # First, each query attends to all the cached keys/value (i.e. full prefix)
@@ -246,8 +246,8 @@ class CausalSelfAttention(nn.Module):
             attn_mask[:, :prefix_len] = True
             # Then, causal attention within this chunk
             attn_mask[:, prefix_len:] = torch.tril(torch.ones((Tq, Tq), dtype=torch.bool, device=q.device))
-            a = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, enable_gqa=enable_gqa)
+            a = F.scaled_dot_product_attention(q, k, v, dropout_p=self.dropout.p, attn_mask=attn_mask, enable_gqa=enable_gqa)
 
         # Re-assemble the heads side by side and project back to residual stream
         out = a.permute(0, 2, 1, 3).flatten(start_dim=2)
-        return self.out(out)
+        return self.dropout(self.out(out))
