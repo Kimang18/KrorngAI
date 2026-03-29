@@ -171,20 +171,20 @@ class KVCache:
 
 
 class MLP(nn.Module):
-    def __init__(self, n_state: int, dropout: float = 0.0):
+    def __init__(self, n_state: int, n_feedforward: int, dropout: float = 0.0, bias: bool = True):
         super().__init__()
-        self.c_fc = LinearWrapper(n_state, 4 * n_state)
-        self.up_proj = LinearWrapper(n_state, 4 * n_state)
-        self.c_proj = LinearWrapper(4 * n_state, n_state)
+        self.gate_proj = LinearWrapper(n_state, n_feedforward, bias=bias)
+        self.up_proj = LinearWrapper(n_state, n_feedforward, bias=bias)
+        self.down_proj = LinearWrapper(n_feedforward, n_state, bias=bias)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         x_up = self.up_proj(x)
-        x = F.silu(self.c_fc(x))
+        x = F.silu(self.gate_proj(x))
         # x = F.relu(x).square() * x_up
         # x = F.gelu(x, approximate="tanh") * x_up
         x = x * x_up
-        return self.dropout(self.c_proj(x))
+        return self.dropout(self.down_proj(x))
 
 
 class CausalSelfAttention(nn.Module):
