@@ -45,7 +45,7 @@ class ResidualAttentionBlock(nn.Module):
         self.attn = CausalSelfAttention(layer_idx, n_state, n_head, n_kv_head, dropout)
         self.post_ln1 = RMSNormWrapper(n_state)
         self.pre_ln2 = RMSNormWrapper(n_state)
-        self.mlp = MLP(n_state, dropout)
+        self.mlp = MLP(n_state, 4 * n_state, dropout)
         self.post_ln2 = RMSNormWrapper(n_state)
 
     def forward(
