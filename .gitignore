@@ -1,6 +1,9 @@
 # ignore common script for different pypi
 whisper/neo_whisper/nn_utils.py
 whisper/neo_whisper/common.py
+tror-yong-lm/tror_yong_lm/nn_utils.py
+tror-yong-lm/tror_yong_lm/common.py
+
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
