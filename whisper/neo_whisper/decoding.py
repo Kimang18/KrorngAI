@@ -29,7 +29,7 @@ except (ImportError, ModuleNotFoundError):
 
 if TYPE_CHECKING:
     from .model import Whisper
-    from .whisper import NeoWhisper
+    from .neo_whisper import NeoWhisper
 
 from .tokenizer import get_tokenizer, NeoTokenizer
 from .nn_utils import KVCache

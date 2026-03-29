@@ -6,8 +6,8 @@ except (ImportError, ModuleNotFoundError):
     raise
 
 from .tokenizer import get_tokenizer
-from .whisper import NeoWhisper
-from .whisper import NeoModelDimensions
+from .neo_whisper import NeoWhisper
+from .neo_whisper import NeoModelDimensions
 from .model import Whisper, ModelDimensions
 from .decoding import NeoDecodingOptions as DecodingOptions
 from .decoding import decode, detect_language
