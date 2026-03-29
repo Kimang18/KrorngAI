@@ -109,7 +109,7 @@ class ResidualAttentionBlock(nn.Module):
         self.cross_attn = CrossMultiHeadAttention(n_state, n_head) if cross_attn else None
         self.cross_ln = RMSNormWrapper(n_state) if cross_attn else None
         self.cross_dropout = nn.Dropout(dropout)
-        self.mlp = MLP(n_state, dropout)
+        self.mlp = MLP(n_state, 4 * n_state, dropout)
         self.ln2 = RMSNormWrapper(n_state)
 
     def forward(
@@ -172,10 +172,10 @@ class AudioEncoder(nn.Module):
         """
         layers_mapping = {}
         for i in range(len(self.blocks)):
-            layers_mapping[f'blocks.{i}.mlp.0.weight'] = f'blocks.{i}.mlp.c_fc.weight'
-            layers_mapping[f'blocks.{i}.mlp.0.bias'] = f'blocks.{i}.mlp.c_fc.bias'
-            layers_mapping[f'blocks.{i}.mlp.2.weight'] = f'blocks.{i}.mlp.c_proj.weight'
-            layers_mapping[f'blocks.{i}.mlp.2.bias'] = f'blocks.{i}.mlp.c_proj.bias'
+            layers_mapping[f'blocks.{i}.mlp.0.weight'] = f'blocks.{i}.mlp.gate_proj.weight'
+            layers_mapping[f'blocks.{i}.mlp.0.bias'] = f'blocks.{i}.mlp.gate_proj.bias'
+            layers_mapping[f'blocks.{i}.mlp.2.weight'] = f'blocks.{i}.mlp.down_proj.weight'
+            layers_mapping[f'blocks.{i}.mlp.2.bias'] = f'blocks.{i}.mlp.down_proj.bias'
         new_state_dict = {}
         for old_layer, value in state_dict.items():
             if old_layer in layers_mapping:
@@ -228,7 +228,9 @@ class TextDecoder(nn.Module):
         nn.init.zeros_(self.lm_head.weight)
 
         for block in self.blocks:
-            nn.init.zeros_(block.mlp.c_proj.weight)
+            nn.init.zeros_(block.mlp.gate_proj.weight)
+            nn.init.zeros_(block.mlp.up_proj.weight)
+            nn.init.zeros_(block.mlp.down_proj.weight)
             nn.init.zeros_(block.attn.out.weight)
             nn.init.zeros_(block.cross_attn.out.weight)
 
