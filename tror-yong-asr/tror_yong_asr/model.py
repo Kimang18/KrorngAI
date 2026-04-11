@@ -8,6 +8,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+import math
+from .tokenizer import ASRTokenizer
 from .nn_utils import (
     precompute_rotary_emb,
     norm,
@@ -50,8 +52,8 @@ class MultiheadAttention(nn.Module):
                 q = apply_rotary_emb(q, cos[:, [1]], sin[:, [1]])
             else:
                 q = apply_rotary_emb(q, cos, sin)
-        q = norm(q)
         q = q.permute(0, 2, 1, 3)
+        q = norm(q)
         return q
 
     def kv_projection(self, key, value, cos_sin=None, kv_cache=None):
@@ -72,8 +74,8 @@ class MultiheadAttention(nn.Module):
                 k_cos = torch.concatenate([cos[:, [0]], cos[:, :-1]], dim=1)
                 k_sin = torch.concatenate([sin[:, [0]], sin[:, :-1]], dim=1)
                 k = apply_rotary_emb(k, k_cos, k_sin)
-        k = norm(k)
         k = k.permute(0, 2, 1, 3)
+        k = norm(k)
 
         v = self.v_proj(value)
         v = v.view(*v.shape[:2], self.n_head, -1)
@@ -165,19 +167,14 @@ class TrorYongConfig:
     n_layer: int
     dropout: float = 0.0
     bias: bool = True
+    pad_id: int
+    eot_id: int
 
 
 class TrorYongASR(nn.Module):
-    def __init__(self, config, tokenizer, verbose=True) -> None:
+    def __init__(self, config, verbose=True) -> None:
         super().__init__()
         self.config = config
-        self.tokenizer = tokenizer
-        self.pad_id = tokenizer.eot # pad_id
-        self.eot_id = tokenizer.eot
-        self.perm_forward = True
-        self.perm_mirrored = True
-        self.max_gen_perms = 2
-        self.n_sot_tokens = len(tokenizer.sot_sequence)
 
         self.encoder = AudioEncoder(
             config.n_mels,
@@ -186,7 +183,7 @@ class TrorYongASR(nn.Module):
             config.n_head,
             config.n_layer
         )
-        self.n_head = config.n_head
+        self.n_head = 2 * config.n_head
         self.head_dim = config.n_embed // self.n_head
         cos, sin = precompute_rotary_emb(10 * config.n_text_ctx, self.head_dim, device=self.device)
         self.register_buffer("cos", cos, persistent=False)
@@ -195,7 +192,7 @@ class TrorYongASR(nn.Module):
         # Make vocab_size multiple of 64
         self.vocab_size = config.vocab_size
         self.opt_vocab_size = (config.vocab_size + 63) // 64 * 64
-        self.tok_embed = nn.Embedding(self.opt_vocab_size, config.n_embed, padding_idx=self.pad_id)
+        self.tok_embed = nn.Embedding(self.opt_vocab_size, config.n_embed, padding_idx=self.config.pad_id)
         self.pos_embed = nn.Parameter(torch.Tensor(1, config.n_text_ctx, config.n_embed))
         self.dropout = nn.Dropout(config.dropout)
         self.decoder = DecoderBlock(config.n_embed, self.n_head, config.n_embed * 4, config.dropout, config.bias)
@@ -213,7 +210,7 @@ class TrorYongASR(nn.Module):
             print_banner()
 
     def get_token_embedding(self, token_ids):
-        return self.tok_embed(token_ids)
+        return self.tok_embed(token_ids) * math.sqrt(self.config.n_embed)
 
     def encode(self, mels: Tensor) -> Tensor:
         return self.encoder(mels)
@@ -243,7 +240,7 @@ class TrorYongASR(nn.Module):
         q_proj, k_proj, v_proj = self.decoder.self_attn.qkv_projection(norm(q), ctx, ctx, cos_sin)
         mask = self.mask[:L, :L]
         key_padding_mask = torch.zeros((b, L), device=self.device)
-        key_padding_mask.masked_fill_(input_ids == self.pad_id, -float('inf'))
+        key_padding_mask.masked_fill_(input_ids == self.config.pad_id, -float('inf'))
 
         res = self.decoder.forward_self_attn(q, q_proj, k_proj, v_proj, mask, key_padding_mask)
         res_q_proj = self.decoder.cross_attn.q_projection(norm(res), cos_sin)
@@ -261,7 +258,7 @@ class TrorYongASR(nn.Module):
         return self.encoder.conv1.weight.device
 
     @torch.inference_mode()
-    def decode(self, mels: Tensor, max_tokens: int, temperature=1.0, top_k=None, seed=168):
+    def decode(self, mels: Tensor, tokenizer: ASRTokenizer, max_tokens: int, temperature=1.0, top_k=None, seed=168):
         """
         mels: (n_mels,)
         max_tokens: int
@@ -280,7 +277,7 @@ class TrorYongASR(nn.Module):
         aud = norm(self.encoder(mels))
         aud_k_proj, aud_v_proj = self.decoder.cross_attn.kv_projection(aud, aud)
 
-        idx = torch.as_tensor([self.tokenizer.sot_sequence], dtype=torch.long, device=mels.device)
+        idx = torch.as_tensor([tokenizer.sot_sequence], dtype=torch.long, device=mels.device)
         n = idx.shape[1]
         idx_next = None
         for i in range(n, n+max_tokens):
@@ -314,7 +311,7 @@ class TrorYongASR(nn.Module):
             else:
                 idx_next = logits.argmax(dim=-1)
             idx = torch.cat((idx, idx_next), dim=1)
-            if idx_next.item() == self.eot_id:
+            if idx_next.item() == tokenizer.eot_id:
                 break
         return idx
 
