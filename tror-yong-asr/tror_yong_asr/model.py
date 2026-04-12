@@ -106,6 +106,14 @@ class MultiheadAttention(nn.Module):
             attn_mask = attn_mask_expanded + key_mask_expanded
 
         qkv = F.scaled_dot_product_attention(q_proj, k_proj, v_proj, dropout_p=self.dropout.p, attn_mask=attn_mask, is_causal=False)
+
+        if self.self_attn:
+            if q_proj.shape == v_proj.shape:
+                vn = F.normalize(v_proj, dim=-1, eps=1e-9)
+            else:  # handle KVCache in decoding, q_proj=(b, n_head, 1, n_embed) != v_proj=(b, n_head, lk, n_embed)
+                vn = F.normalize(v_proj[:, :, [-1], :], dim=-1, eps=1e-9)
+            qkv = qkv - torch.sum(qkv * vn, dim=-1, keepdim=True) * vn
+
         qkv = qkv.permute(0, 2, 1, 3).flatten(start_dim=2)        # (b, lq, n_embed)
         out = self.out_proj(qkv)
 
