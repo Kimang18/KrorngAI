@@ -167,8 +167,8 @@ class TrorYongConfig:
     n_layer: int
     dropout: float = 0.0
     bias: bool = True
-    pad_id: int
-    eot_id: int
+    pad_id: int = 0
+    eot_id: int = 2
 
 
 class TrorYongASR(nn.Module):
@@ -311,7 +311,7 @@ class TrorYongASR(nn.Module):
             else:
                 idx_next = logits.argmax(dim=-1)
             idx = torch.cat((idx, idx_next), dim=1)
-            if idx_next.item() == tokenizer.eot_id:
+            if idx_next.item() == self.config.eot_id:
                 break
         return idx
 
