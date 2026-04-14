@@ -276,10 +276,10 @@ class TrorYongASRModel(nn.Module):
         return self.encoder.conv1.weight.device
 
     @classmethod
-    def from_pretrained(cls, model_id: str = "KrorngAI/tror-yong-asr-tiny", trust_remote_code: Optional[bool]=None):
+    def from_pretrained(cls, model_id: str = "KrorngAI/tror-yong-asr-tiny", verbose=True, trust_remote_code: Optional[bool]=None):
         assert model_id in PRETRAINED_MODEL, f"Not supported repo, please check again. {model_id}"
         config = AutoConfig.from_pretrained(model_id, trust_remote_code=trust_remote_code)
-        model = cls(config)
+        model = cls(config, verbose=verbose)
         file_path = hf_hub_download(model_id, filename="model.safetensors")
         load_model(model, file_path)
         return model
