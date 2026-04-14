@@ -1,3 +1,2 @@
-from .model import TrorYongASR, TrorYongConfig
-from .tokenizer import ASRTokenizer
+from .model import TrorYongASRModel, TrorYongASRConfig
 from ._version import __version__

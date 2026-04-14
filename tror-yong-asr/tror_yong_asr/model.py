@@ -2,14 +2,16 @@
 # Date: March 2026
 
 
-from typing import Sequence
+from typing import Sequence, Optional
 from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from transformers import AutoConfig, AutoTokenizer
+from huggingface_hub import hf_hub_download
+from safetensors.torch import load_model
 import math
-from .tokenizer import ASRTokenizer
 from .nn_utils import (
     precompute_rotary_emb,
     norm,
@@ -26,6 +28,12 @@ except (ImportError, ModuleNotFoundError):
     raise
 
 
+PRETRAINED_MODEL = [
+    "KrorngAI/tror-yong-asr-tiny",
+    "KrorngAI/tror-yong-asr-small"
+]
+
+
 class MultiheadAttention(nn.Module):
     def __init__(self, n_embed, n_head, dropout=0.0, bias=True, self_attn=True):
         super().__init__()
@@ -37,7 +45,7 @@ class MultiheadAttention(nn.Module):
         self.v_proj = LinearWrapper(n_embed, n_embed, bias=bias)
         self.out_proj = LinearWrapper(n_embed, n_embed, bias=bias)
         self.self_attn = self_attn
-        self.max_logits = None
+        # self.max_logits = None
 
     def q_projection(self, query, cos_sin):
         """
@@ -165,7 +173,7 @@ class DecoderBlock(nn.Module):
 
 
 @dataclass
-class TrorYongConfig:
+class TrorYongASRConfig:
     vocab_size: int  # use the tokenizer's vocab size
     n_mels: int
     n_audio_ctx: int
@@ -177,9 +185,10 @@ class TrorYongConfig:
     bias: bool = True
     pad_id: int = 0
     eot_id: int = 2
+    tie_word_embeddings: bool = True
 
 
-class TrorYongASR(nn.Module):
+class TrorYongASRModel(nn.Module):
     def __init__(self, config, verbose=True) -> None:
         super().__init__()
         self.config = config
@@ -207,7 +216,8 @@ class TrorYongASR(nn.Module):
         self.lm_head = LinearWrapper(config.n_embed, self.opt_vocab_size, bias=False)
 
         # weight tying
-        self.tok_embed.weight = self.lm_head.weight
+        if config.tie_word_embeddings:
+            self.tok_embed.weight = self.lm_head.weight
 
         # When using F.scaled_dot_product, True means counted in attention, False means masked
         mask = torch.empty(config.n_text_ctx, config.n_text_ctx).fill_(-float('inf')).triu_(1)
@@ -265,8 +275,17 @@ class TrorYongASR(nn.Module):
     def device(self):
         return self.encoder.conv1.weight.device
 
+    @classmethod
+    def from_pretrained(cls, model_id: str = "KrorngAI/tror-yong-asr-tiny", trust_remote_code: Optional[bool]=None):
+        assert model_id in PRETRAINED_MODEL, f"Not supported repo, please check again. {model_id}"
+        config = AutoConfig.from_pretrained(model_id, trust_remote_code=trust_remote_code)
+        model = cls(config)
+        file_path = hf_hub_download(model_id, filename="model.safetensors")
+        load_model(model, file_path)
+        return model
+
     @torch.inference_mode()
-    def decode(self, mels: Tensor, tokenizer: ASRTokenizer, max_tokens: int, temperature=1.0, top_k=None, seed=168):
+    def decode(self, mels: Tensor, tokenizer: AutoTokenizer, max_tokens: int, temperature=1.0, top_k=None, seed=168):
         """
         mels: (n_mels,)
         max_tokens: int
