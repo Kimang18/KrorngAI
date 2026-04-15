@@ -9,6 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 from transformers import AutoConfig
+from transformers.modeling_outputs import CausalLMOutput
 from huggingface_hub import hf_hub_download
 from safetensors.torch import load_model
 import math
@@ -264,13 +265,13 @@ class TrorYongASRModel(nn.Module):
         res = self.decoder.forward_self_attn(q, q_proj, k_proj, v_proj, mask, key_padding_mask)
         res_q_proj = self.decoder.cross_attn.q_projection(norm(res), cos_sin)
         res = self.decoder.forward_cross_attn_and_mlp(res, res_q_proj, aud_k_proj, aud_v_proj)
+        logits = self.lm_head(norm(res))  # (b, L, n_vocab)
         if target_ids is not None:
-            logits = self.lm_head(norm(res))  # (b, L, n_vocab)
             loss = F.cross_entropy(logits.flatten(end_dim=1).float(), target_ids.flatten(), ignore_index=-100, reduction='mean')
-            return logits, loss
+            return CausalLMOutput(logits=logits, loss=loss)
         else:
             # do not compute loss
-            return self.lm_head(norm(res)).float(), None
+            return CausalLMOutput(logits=logits)
 
     @property
     def device(self):
