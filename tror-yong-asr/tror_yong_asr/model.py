@@ -202,7 +202,8 @@ class TrorYongASRModel(nn.Module):
         )
         self.n_head = 2 * config.n_head
         self.head_dim = config.n_embed // self.n_head
-        cos, sin = precompute_rotary_emb(10 * config.n_text_ctx, self.head_dim, device=self.device)
+        self.rotary_seq_len = 10 * config.n_text_ctx
+        cos, sin = precompute_rotary_emb(self.rotary_seq_len, self.head_dim, device=self.device)
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
 
@@ -222,9 +223,8 @@ class TrorYongASRModel(nn.Module):
         # When using F.scaled_dot_product, True means counted in attention, False means masked
         mask = torch.empty(config.n_text_ctx, config.n_text_ctx).fill_(-float('inf')).triu_(1)
         self.register_buffer("mask", mask, persistent=False)
-        self.apply(self.init_weights)
-        nn.init.trunc_normal_(self.pos_embed, std=1.0)
         self.prefix = None
+        self.init_weights()
         if verbose:
             print_banner()
 
@@ -353,18 +353,43 @@ class TrorYongASRModel(nn.Module):
         return idx
 
     @torch.no_grad()
-    def init_weights(self, module: nn.Module, name: str = '', exclude: Sequence[str] = ('')):
-        """Initialize the weights using the typical initialization schemes used in SOTA models."""
-        if any(map(name.startswith, exclude)):
-            return
-        if isinstance(module, nn.Linear):
-            nn.init.trunc_normal_(module.weight, std=0.02)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            nn.init.trunc_normal_(module.weight, std=0.02)
-            if module.padding_idx is not None:
-                module.weight.data[module.padding_idx].zero_()
+    def init_weights(self):
+        n_embed = self.config.n_embed
+        s = 3**0.5 * n_embed**-0.5
+        torch.nn.init.normal_(self.encoder.conv1.weight, mean=0.0, std=0.001)
+        torch.nn.init.normal_(self.encoder.conv2.weight, mean=0.0, std=0.001)
+        for block in self.encoder.blocks:
+            torch.nn.init.uniform_(block.attn.query.weight, -s, s)
+            torch.nn.init.uniform_(block.attn.key.weight, -s, s)
+            torch.nn.init.uniform_(block.attn.value.weight, -s, s)
+            torch.nn.init.zeros_(block.attn.out.weight)
+            torch.nn.init.uniform_(block.mlp[0].weight, -s * 0.4, s * 0.4)
+            torch.nn.init.zeros_(block.mlp[2].weight)
+
+        torch.nn.init.uniform_(self.decoder.self_attn.q_proj.weight, -s, s)
+        torch.nn.init.uniform_(self.decoder.self_attn.k_proj.weight, -s, s)
+        torch.nn.init.uniform_(self.decoder.self_attn.v_proj.weight, -s, s)
+        torch.nn.init.zeros_(self.decoder.self_attn.out_proj.weight)
+        torch.nn.init.uniform_(self.decoder.cross_attn.q_proj.weight, -s, s)
+        torch.nn.init.uniform_(self.decoder.cross_attn.k_proj.weight, -s, s)
+        torch.nn.init.uniform_(self.decoder.cross_attn.v_proj.weight, -s, s)
+        torch.nn.init.zeros_(self.decoder.cross_attn.out_proj.weight)
+        torch.nn.init.uniform_(self.decoder.mlp.gate_proj.weight, -s * 0.4, s * 0.4)
+        torch.nn.init.uniform_(self.decoder.mlp.up_proj.weight, -s * 0.4, s * 0.4)
+        torch.nn.init.zeros_(self.decoder.mlp.down_proj.weight)
+
+        # Embedding
+        torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
+        # tie token embedding
+        self.tok_embed.weight = self.lm_head.weight
+
+        nn.init.trunc_normal_(self.pos_embed, std=1.0)
+
+        # Rotary embeddings
+        cos, sin = precompute_rotary_emb(self.rotary_seq_len, self.head_dim, device=self.device)
+        self.cos, self.sin = cos, sin
+
+        self.mask = torch.empty(self.config.n_text_ctx, self.config.n_text_ctx).fill_(-float('inf')).triu_(1)
 
         if self.tok_embed.weight.device.type == 'cuda':
             self.tok_embed.weight = self.tok_embed.weight.to(torch.bfloat16)
