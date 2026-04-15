@@ -2,13 +2,13 @@
 # Date: March 2026
 
 
-from typing import Sequence, Optional
+from typing import Sequence, Optional, List
 from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from transformers import AutoConfig, AutoTokenizer
+from transformers import AutoConfig
 from huggingface_hub import hf_hub_download
 from safetensors.torch import load_model
 import math
@@ -224,6 +224,7 @@ class TrorYongASRModel(nn.Module):
         self.register_buffer("mask", mask, persistent=False)
         self.apply(self.init_weights)
         nn.init.trunc_normal_(self.pos_embed, std=1.0)
+        self.prefix = None
         if verbose:
             print_banner()
 
@@ -284,12 +285,21 @@ class TrorYongASRModel(nn.Module):
         load_model(model, file_path)
         return model
 
+    def set_prefix(self, prefix: List[int]):
+        """
+        Set bos token, language token, and task token
+        This is used in decode function
+        """
+        self.prefix = prefix
+
     @torch.inference_mode()
-    def decode(self, mels: Tensor, tokenizer: AutoTokenizer, max_tokens: int, temperature=1.0, top_k=None, seed=168):
+    def decode(self, mels: Tensor, max_tokens: int, temperature=1.0, top_k=None, seed=168):
         """
         mels: (n_mels,)
         max_tokens: int
         """
+        if self.prefix is None:
+            raise SyntaxError("Please provide bos, language, and task tokens as prefix using set_prefix before calling decode.")
 
         seq_len = self.mask.shape[0]
         assert max_tokens <= seq_len, "too long sequence generation, consider lower max_tokens"
@@ -304,7 +314,7 @@ class TrorYongASRModel(nn.Module):
         aud = norm(self.encoder(mels))
         aud_k_proj, aud_v_proj = self.decoder.cross_attn.kv_projection(aud, aud)
 
-        idx = torch.as_tensor([tokenizer.sot_sequence], dtype=torch.long, device=mels.device)
+        idx = torch.as_tensor([self.prefix], dtype=torch.long, device=mels.device)
         n = idx.shape[1]
         idx_next = None
         for i in range(n, n+max_tokens):
