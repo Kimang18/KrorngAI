@@ -2,7 +2,7 @@
 # Date: March 2026
 
 
-from typing import Sequence, Optional, List
+from typing import Optional, List
 from dataclasses import dataclass
 import torch
 import torch.nn as nn
@@ -89,8 +89,8 @@ class MultiheadAttention(nn.Module):
         v = self.v_proj(value)
         v = v.view(*v.shape[:2], self.n_head, -1)
         v = v.permute(0, 2, 1, 3)
-        if kv_cache is not None: # only self_attn use kv_cache
-            k, v = kv_cache.insert_kv(0, k, v) # there is only one layer, so layer_idx=0
+        if kv_cache is not None:  # only self_attn use kv_cache
+            k, v = kv_cache.insert_kv(0, k, v)  # there is only one layer, so layer_idx=0
         return k, v
 
     def qkv_projection(self, query, key, value, cos_sin, kv_cache=None):
@@ -236,7 +236,6 @@ class TrorYongASRModel(nn.Module):
         return self.encoder(mels)
 
     def forward(self, mels, input_ids, target_ids=None):
-
         """
         mels: log-mel spectrum from audio array
         input_ids including sot sequence
@@ -292,6 +291,43 @@ class TrorYongASRModel(nn.Module):
         This is used in decode function
         """
         self.prefix = prefix
+
+    @torch.inference_mode()
+    def detect_language(self, mels: Tensor, tokenizer):
+        mels = mels.unsqueeze(0)
+        aud = norm(self.encoder(mels))
+        aud_k_proj, aud_v_proj = self.decoder.cross_attn.kv_projection(aud, aud)
+
+        idx = torch.as_tensor([[tokenizer.sot]], dtype=torch.long, device=self.device)
+        q = self.pos_embed[:, [0]]
+        ctx = self.get_token_embedding(idx)  # the context vector is just null context
+        # due to PARSeq's implementation, when q.shape[-1] = 1, cos[1] and sin[1] are q and cos[0] and sin[0] are for k
+        # but for null context vector, q and k use the same cos and sin
+        cos = torch.concatenate([self.cos[:, [0]], self.cos[:, [0]]], dim=1)
+        sin = torch.concatenate([self.sin[:, [0]], self.sin[:, [0]]], dim=1)
+
+        mask = self.mask[[0], [0]]
+        ctx = norm(ctx)
+        q_proj, k_proj, v_proj = self.decoder.self_attn.qkv_projection(norm(q), ctx, ctx, (cos, sin))
+        res = self.decoder.forward_self_attn(q, q_proj, k_proj, v_proj, mask)
+        res_q_proj = self.decoder.cross_attn.q_projection(norm(res), (cos, sin))
+        res = self.decoder.forward_cross_attn_and_mlp(res, res_q_proj, aud_k_proj, aud_v_proj)
+        logits = self.lm_head(norm(res)).float()
+
+        # suppress non-language tokens
+        mask = torch.ones(logits.shape[-1], dtype=torch.bool)
+        mask[list(tokenizer.all_language_tokens)] = False
+        logits[:, -1, mask] = -float('inf')
+        language_tokens = logits.argmax(dim=-1)
+        language_token_probs = F.softmax(logits, dim=-1)
+        language_probs = [
+            {
+                c: language_token_probs[0, 0, j].item()
+                for j, c in zip(tokenizer.all_language_tokens, tokenizer.all_language_codes)
+            }
+        ]
+
+        return language_tokens[0], language_probs[0]
 
     @torch.inference_mode()
     def decode(self, mels: Tensor, max_tokens: int, temperature=1.0, top_k=None, seed=168):
@@ -357,8 +393,8 @@ class TrorYongASRModel(nn.Module):
     def init_weights(self):
         n_embed = self.config.n_embed
         s = 3**0.5 * n_embed**-0.5
-        torch.nn.init.normal_(self.encoder.conv1.weight, mean=0.0, std=0.001)
-        torch.nn.init.normal_(self.encoder.conv2.weight, mean=0.0, std=0.001)
+        torch.nn.init.normal_(self.encoder.conv1.weight, mean=0.0, std=0.02)
+        torch.nn.init.normal_(self.encoder.conv2.weight, mean=0.0, std=0.02)
         for block in self.encoder.blocks:
             torch.nn.init.uniform_(block.attn.query.weight, -s, s)
             torch.nn.init.uniform_(block.attn.key.weight, -s, s)
