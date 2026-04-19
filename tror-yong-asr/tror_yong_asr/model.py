@@ -219,7 +219,8 @@ class TrorYongASRModel(nn.Module):
 
         # weight tying
         if config.tie_word_embeddings:
-            self.tok_embed.weight = self.lm_head.weight
+            # self.tok_embed.weight = self.lm_head.weight
+            self.lm_head.weight = self.tok_embed.weight
 
         # When using F.scaled_dot_product, True means counted in attention, False means masked
         mask = torch.empty(config.n_text_ctx, config.n_text_ctx).fill_(-float('inf')).triu_(1)
@@ -391,10 +392,11 @@ class TrorYongASRModel(nn.Module):
 
     @torch.no_grad()
     def init_weights(self):
-        n_embed = self.config.n_embed
-        s = 3**0.5 * n_embed**-0.5
         torch.nn.init.normal_(self.encoder.conv1.weight, mean=0.0, std=0.02)
         torch.nn.init.normal_(self.encoder.conv2.weight, mean=0.0, std=0.02)
+
+        n_embed = self.config.n_embed
+        s = 3**0.5 * n_embed**-0.5
         for block in self.encoder.blocks:
             torch.nn.init.uniform_(block.attn.query.weight, -s, s)
             torch.nn.init.uniform_(block.attn.key.weight, -s, s)
@@ -416,9 +418,9 @@ class TrorYongASRModel(nn.Module):
         torch.nn.init.zeros_(self.decoder.mlp.down_proj.weight)
 
         # Embedding
-        torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
+        torch.nn.init.normal_(self.tok_embed.weight, mean=0.0, std=0.001)
         # tie token embedding
-        self.tok_embed.weight = self.lm_head.weight
+        self.lm_head.weight = self.tok_embed.weight
 
         nn.init.trunc_normal_(self.pos_embed, std=1.0)
 
