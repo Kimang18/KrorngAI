@@ -22,16 +22,12 @@ from .nn_utils import (
     KVCache
 )
 from .common import print_banner
-try:
-    from whisper.model import AudioEncoder
-except (ImportError, ModuleNotFoundError):
-    print("You need to install openai-whisper package: pip install git+https://github.com/openai/whisper.git")
-    raise
+from .whisper_audio_encoder import AudioEncoder
 
 
 PRETRAINED_MODEL = [
     "KrorngAI/tror-yong-asr-tiny",
-    "KrorngAI/tror-yong-asr-small"
+    "KrorngAI/tror-yong-asr-small",
 ]
 
 
@@ -71,7 +67,7 @@ class MultiheadAttention(nn.Module):
         """
         k = self.k_proj(key)
         k = k.view(*k.shape[:2], self.n_head, -1)
-        if cos_sin is not None:
+        if self.self_attn and cos_sin is not None:  # cross attention does not apply rotary embedding
             cos, sin = cos_sin
             if k.shape[1] == 1:
                 # due to my specific design, there is a shift for cos_sin in q
@@ -110,6 +106,9 @@ class MultiheadAttention(nn.Module):
 
         b, _, lk, _ = k_proj.size()
         if key_padding_mask is not None and attn_mask is not None:
+            # attn_mask is None for cross-attention layer
+            # WARN: attn_mask cannot be None for self-attention layer
+            # key_mask is used during pre-training for self-attention layer
             attn_mask_expanded = attn_mask.view(1, 1, lk, lk).expand(b, self.n_head, -1, -1)
             key_mask_expanded = key_padding_mask.view(b, 1, 1, lk).expand(-1, self.n_head, -1, -1)
             attn_mask = attn_mask_expanded + key_mask_expanded
@@ -139,7 +138,7 @@ class MultiheadAttention(nn.Module):
 
         return self.dropout(out), None
 
-    def forward(self, query, key, value, attn_mask=None, key_padding_mask=None, cos_sin=None, kv_cache=None):
+    def forward(self, query, key, value, cos_sin=None, attn_mask=None, key_padding_mask=None, kv_cache=None):
         """
         query, key, value are not projected yet and will be projected before
         attention mechanism
@@ -157,7 +156,7 @@ class DecoderBlock(nn.Module):
 
     def forward_self_attn(self, q, q_proj, k_proj, v_proj, attn_mask, key_padding_mask=None):
         """
-        q must be unnormalized in order to do residual connection
+        WARN: q must be unnormalized in order to do residual connection
         key_padding_mask is None during inference
         """
         query, sa_weights = self.self_attn.attention_forward(q_proj, k_proj, v_proj, attn_mask, key_padding_mask)
@@ -165,9 +164,20 @@ class DecoderBlock(nn.Module):
 
     def forward_cross_attn_and_mlp(self, res, q_proj, k_proj, v_proj):
         """
-        res must be unnormalized in order to do residual connection
+        WARN: res must be unnormalized in order to do residual connection
         """
-        query, cross_weights = self.cross_attn.attention_forward(q_proj, k_proj, v_proj)
+        query, ca_weights = self.cross_attn.attention_forward(q_proj, k_proj, v_proj)
+        res = res + query
+        res = res + self.mlp(norm(res))
+        return res
+
+    def forward(self, q, ctx, aud, cos_sin, attn_mask, key_padding_mask=None, kv_cache=None):
+        """
+        regular forward pass
+        """
+        query, sa_weights = self.self_attn(norm(q), ctx, ctx, cos_sin, attn_mask, key_padding_mask, kv_cache)
+        res = q.clone() + query
+        query, ca_weights = self.cross_attn(norm(res), aud, aud, cos_sin=cos_sin)
         res = res + query
         res = res + self.mlp(norm(res))
         return res
@@ -219,10 +229,8 @@ class TrorYongASRModel(nn.Module):
 
         # weight tying
         if config.tie_word_embeddings:
-            # self.tok_embed.weight = self.lm_head.weight
             self.lm_head.weight = self.tok_embed.weight
 
-        # When using F.scaled_dot_product, True means counted in attention, False means masked
         mask = torch.empty(config.n_text_ctx, config.n_text_ctx).fill_(-float('inf')).triu_(1)
         self.register_buffer("mask", mask, persistent=False)
         self.prefix = None
@@ -239,7 +247,8 @@ class TrorYongASRModel(nn.Module):
     def forward(self, mels, input_ids, target_ids=None):
         """
         mels: log-mel spectrum from audio array
-        input_ids including sot sequence
+        input_ids: input token ids for decoder (inclu. sot sequence)
+        target_ids: target token ids to compute cross_entropy loss
         """
 
         # decoding layer
@@ -248,7 +257,6 @@ class TrorYongASRModel(nn.Module):
 
         aud = self.encoder(mels)
         aud = norm(aud)
-        aud_k_proj, aud_v_proj = self.decoder.cross_attn.kv_projection(aud, aud)
 
         q = self.dropout(self.pos_embed[:, :L].expand(b, -1, -1))
         ctx = self.get_token_embedding(input_ids)
@@ -257,14 +265,9 @@ class TrorYongASRModel(nn.Module):
         ctx = norm(ctx)
 
         cos_sin = self.cos[:, :L], self.sin[:, :L]
-        q_proj, k_proj, v_proj = self.decoder.self_attn.qkv_projection(norm(q), ctx, ctx, cos_sin)
-        mask = self.mask[:L, :L]
-        key_padding_mask = torch.zeros((b, L), device=self.device)
-        key_padding_mask.masked_fill_(input_ids == self.config.pad_id, -float('inf'))
 
-        res = self.decoder.forward_self_attn(q, q_proj, k_proj, v_proj, mask, key_padding_mask)
-        res_q_proj = self.decoder.cross_attn.q_projection(norm(res), cos_sin)
-        res = self.decoder.forward_cross_attn_and_mlp(res, res_q_proj, aud_k_proj, aud_v_proj)
+        attn_mask = self.mask[:L, :L]
+        res = self.decoder(q, ctx, aud, cos_sin, attn_mask)
         logits = self.lm_head(norm(res))  # (b, L, n_vocab)
         if target_ids is not None:
             loss = F.cross_entropy(logits.flatten(end_dim=1).float(), target_ids.flatten(), ignore_index=-100, reduction='mean')
@@ -295,24 +298,25 @@ class TrorYongASRModel(nn.Module):
 
     @torch.inference_mode()
     def detect_language(self, mels: Tensor, tokenizer):
+        """
+        Predicting the language of audio
+        NOTE: I could have called `forward` but there is a careful attention required for cos, sin
+        """
         mels = mels.unsqueeze(0)
         aud = norm(self.encoder(mels))
-        aud_k_proj, aud_v_proj = self.decoder.cross_attn.kv_projection(aud, aud)
 
         idx = torch.as_tensor([[tokenizer.sot]], dtype=torch.long, device=self.device)
         q = self.pos_embed[:, [0]]
         ctx = self.get_token_embedding(idx)  # the context vector is just null context
+        ctx = norm(ctx)
+
         # due to PARSeq's implementation, when q.shape[-1] = 1, cos[1] and sin[1] are q and cos[0] and sin[0] are for k
         # but for null context vector, q and k use the same cos and sin
         cos = torch.concatenate([self.cos[:, [0]], self.cos[:, [0]]], dim=1)
         sin = torch.concatenate([self.sin[:, [0]], self.sin[:, [0]]], dim=1)
 
-        mask = self.mask[[0], [0]]
-        ctx = norm(ctx)
-        q_proj, k_proj, v_proj = self.decoder.self_attn.qkv_projection(norm(q), ctx, ctx, (cos, sin))
-        res = self.decoder.forward_self_attn(q, q_proj, k_proj, v_proj, mask)
-        res_q_proj = self.decoder.cross_attn.q_projection(norm(res), (cos, sin))
-        res = self.decoder.forward_cross_attn_and_mlp(res, res_q_proj, aud_k_proj, aud_v_proj)
+        attn_mask = self.mask[[0], [0]]
+        res = self.decoder(q, ctx, aud, (cos, sin), attn_mask)
         logits = self.lm_head(norm(res)).float()
 
         # suppress non-language tokens
@@ -368,8 +372,13 @@ class TrorYongASRModel(nn.Module):
                 cos_sin = self.cos[:, i-2:i], self.sin[:, i-2:i]
                 mask = self.mask[[i-1], :i]
             ctx = norm(ctx)
-            q_proj, k_proj, v_proj = self.decoder.self_attn.qkv_projection(norm(q), ctx, ctx, cos_sin, kv_cache=kv_cache)
-            res = self.decoder.forward_self_attn(q, q_proj, k_proj, v_proj, mask)
+
+            # q_proj, k_proj, v_proj = self.decoder.self_attn.qkv_projection(norm(q), ctx, ctx, cos_sin, kv_cache=kv_cache)
+            # res = self.decoder.forward_self_attn(q, q_proj, k_proj, v_proj, mask)
+            # NOTE: The 2 lines below are equivalent to the 2 lines above
+            query, sa_weights = self.decoder.self_attn(norm(q), ctx, ctx, cos_sin, mask, key_padding_mask=None, kv_cache=kv_cache)
+            res = q + query
+
             res_q_proj = self.decoder.cross_attn.q_projection(norm(res), cos_sin)
             res = self.decoder.forward_cross_attn_and_mlp(res, res_q_proj, aud_k_proj, aud_v_proj)
 
