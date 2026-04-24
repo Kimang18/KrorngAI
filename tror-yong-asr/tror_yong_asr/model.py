@@ -26,8 +26,10 @@ from .whisper_audio_encoder import AudioEncoder
 
 
 PRETRAINED_MODEL = [
-    "KrorngAI/tror-yong-asr-tiny",
-    "KrorngAI/tror-yong-asr-small",
+    "KrorngAI/TrorYongASR-tiny",
+    "KrorngAI/TrorYongASR-small",
+    "Kimang18/tror-yong-asr-tiny",  # for testing TODO: remove this before publish
+    "Kimang18/tror-yong-asr-small"  # for testing TODO: remove this before publish
 ]
 
 
@@ -211,6 +213,7 @@ class TrorYongASRModel(nn.Module):
             config.n_head,
             config.n_layer
         )
+        # decoder's head is twice the head of encoder
         self.n_head = 2 * config.n_head
         self.head_dim = config.n_embed // self.n_head
         self.rotary_seq_len = 10 * config.n_text_ctx
