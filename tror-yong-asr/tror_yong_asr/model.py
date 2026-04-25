@@ -34,7 +34,7 @@ PRETRAINED_MODEL = [
 
 
 class MultiheadAttention(nn.Module):
-    def __init__(self, n_embed, n_head, dropout=0.0, bias=True, self_attn=True):
+    def __init__(self, n_embed, n_head, dropout=0.0, bias=True, is_sa=True):
         super().__init__()
         self.n_embed = n_embed
         self.n_head = n_head
@@ -43,12 +43,12 @@ class MultiheadAttention(nn.Module):
         self.k_proj = LinearWrapper(n_embed, n_embed, bias=bias)
         self.v_proj = LinearWrapper(n_embed, n_embed, bias=bias)
         self.out_proj = LinearWrapper(n_embed, n_embed, bias=bias)
-        self.self_attn = self_attn
+        self.is_sa = is_sa
         # self.max_logits = None
 
-    def q_projection(self, query, cos_sin):
+    def q_projection(self, query, cos_sin=None):
         """
-        Compute and return the projection of query, key, and value
+        Compute and return the projection of query
         """
         q = self.q_proj(query)
         q = q.view(*q.shape[:2], self.n_head, -1)
@@ -69,18 +69,18 @@ class MultiheadAttention(nn.Module):
         """
         k = self.k_proj(key)
         k = k.view(*k.shape[:2], self.n_head, -1)
-        if self.self_attn and cos_sin is not None:  # cross attention does not apply rotary embedding
+        if cos_sin is not None:  # cross attention does not apply rotary embedding
             cos, sin = cos_sin
             if k.shape[1] == 1:
                 # due to my specific design, there is a shift for cos_sin in q
                 k = apply_rotary_emb(k, cos[:, [0]], sin[:, [0]])
             else:
                 # in PARSeq's architecture, the first `key token` is null context (sot) and required no `position token`
-                # for RoPE, the very first position contains `theta=0` (also, no rotation)
+                # for RoPE, the very first position contains `theta=0` (so, no rotation)
                 # So, shift `cos` and `sin` to apply no rotation to null context
-                k_cos = torch.concatenate([cos[:, [0]], cos[:, :-1]], dim=1)
-                k_sin = torch.concatenate([sin[:, [0]], sin[:, :-1]], dim=1)
-                k = apply_rotary_emb(k, k_cos, k_sin)
+                cos = torch.concatenate([cos[:, [0]], cos[:, :-1]], dim=1)
+                sin = torch.concatenate([sin[:, [0]], sin[:, :-1]], dim=1)
+                k = apply_rotary_emb(k, cos, sin)
         k = k.permute(0, 2, 1, 3)
         k = norm(k)
 
@@ -117,10 +117,10 @@ class MultiheadAttention(nn.Module):
 
         qkv = F.scaled_dot_product_attention(q_proj, k_proj, v_proj, dropout_p=self.dropout.p, attn_mask=attn_mask, is_causal=False)
 
-        if self.self_attn:
-            if q_proj.shape == v_proj.shape:
+        if self.is_sa:  # perform 'exclusive self-attention'
+            if qkv.shape == v_proj.shape:
                 vn = F.normalize(v_proj, dim=-1, eps=1e-9)
-            else:  # handle KVCache in decoding, q_proj=(b, n_head, 1, n_embed) != v_proj=(b, n_head, lk, n_embed)
+            else:  # when decoding, qkv=(b, n_head, 1, n_embed) != v_proj=(b, n_head, lk, n_embed)
                 vn = F.normalize(v_proj[:, :, [-1], :], dim=-1, eps=1e-9)
             qkv = qkv - torch.sum(qkv * vn, dim=-1, keepdim=True) * vn
 
@@ -153,7 +153,7 @@ class DecoderBlock(nn.Module):
     def __init__(self, d_model, nhead, dim_feedforward, dropout, bias) -> None:
         super().__init__()
         self.self_attn = MultiheadAttention(d_model, nhead, dropout, bias)
-        self.cross_attn = MultiheadAttention(d_model, nhead, dropout, bias, self_attn=False)
+        self.cross_attn = MultiheadAttention(d_model, nhead, dropout, bias, is_sa=False)
         self.mlp = MLP(d_model, dim_feedforward, dropout, bias)
 
     def forward_self_attn(self, q, q_proj, k_proj, v_proj, attn_mask, key_padding_mask=None):
@@ -176,10 +176,11 @@ class DecoderBlock(nn.Module):
     def forward(self, q, ctx, aud, cos_sin, attn_mask, key_padding_mask=None, kv_cache=None):
         """
         regular forward pass
+        WARN: q must be unnormalized in order to do residual connection
         """
         query, sa_weights = self.self_attn(norm(q), ctx, ctx, cos_sin, attn_mask, key_padding_mask, kv_cache)
         res = q.clone() + query
-        query, ca_weights = self.cross_attn(norm(res), aud, aud, cos_sin=cos_sin)
+        query, ca_weights = self.cross_attn(norm(res), aud, aud)
         res = res + query
         res = res + self.mlp(norm(res))
         return res
@@ -223,12 +224,12 @@ class TrorYongASRModel(nn.Module):
 
         # Make vocab_size multiple of 64
         self.vocab_size = config.vocab_size
-        self.opt_vocab_size = (config.vocab_size + 63) // 64 * 64
-        self.tok_embed = nn.Embedding(self.opt_vocab_size, config.n_embed, padding_idx=self.config.pad_id)
-        self.pos_embed = nn.Parameter(torch.Tensor(1, config.n_text_ctx, config.n_embed))
+        self.pad_vocab_size = (config.vocab_size + 63) // 64 * 64
+        self.tok_embed = nn.Embedding(self.pad_vocab_size, config.n_embed, padding_idx=self.config.pad_id)
+        self.pos_basis = nn.Parameter(torch.Tensor(config.n_embed))
         self.dropout = nn.Dropout(config.dropout)
         self.decoder = DecoderBlock(config.n_embed, self.n_head, config.n_embed * 4, config.dropout, config.bias)
-        self.lm_head = LinearWrapper(config.n_embed, self.opt_vocab_size, bias=False)
+        self.lm_head = LinearWrapper(config.n_embed, self.pad_vocab_size, bias=False)
 
         # weight tying
         if config.tie_word_embeddings:
@@ -261,9 +262,8 @@ class TrorYongASRModel(nn.Module):
         aud = self.encoder(mels)
         aud = norm(aud)
 
-        q = self.dropout(self.pos_embed[:, :L].expand(b, -1, -1))
+        q = self.dropout(self.pos_basis.view(1, 1, -1).expand(b, L, -1))
         ctx = self.get_token_embedding(input_ids)
-        ctx = torch.concatenate([ctx[:, [0]], ctx[:, 1:] + self.pos_embed[:, :L-1]], dim=1)
         ctx = self.dropout(ctx)
         ctx = norm(ctx)
 
@@ -271,7 +271,7 @@ class TrorYongASRModel(nn.Module):
 
         attn_mask = self.mask[:L, :L]
         res = self.decoder(q, ctx, aud, cos_sin, attn_mask)
-        logits = self.lm_head(norm(res))  # (b, L, n_vocab)
+        logits = self.lm_head(norm(res))  # (b, L, pad_vocab_size)
         if target_ids is not None:
             loss = F.cross_entropy(logits.flatten(end_dim=1).float(), target_ids.flatten(), ignore_index=-100, reduction='mean')
             return CausalLMOutput(logits=logits, loss=loss)
@@ -284,7 +284,7 @@ class TrorYongASRModel(nn.Module):
         return self.encoder.conv1.weight.device
 
     @classmethod
-    def from_pretrained(cls, model_id: str = "KrorngAI/tror-yong-asr-tiny", verbose=True, trust_remote_code: Optional[bool]=None):
+    def from_pretrained(cls, model_id: str = "KrorngAI/TrorYongASR-tiny", verbose=True, trust_remote_code: Optional[bool]=None):
         assert model_id in PRETRAINED_MODEL, f"Not supported repo, please check again. {model_id}"
         config = AutoConfig.from_pretrained(model_id, trust_remote_code=trust_remote_code)
         model = cls(config, verbose=verbose)
@@ -309,12 +309,13 @@ class TrorYongASRModel(nn.Module):
         aud = norm(self.encoder(mels))
 
         idx = torch.as_tensor([[tokenizer.sot]], dtype=torch.long, device=self.device)
-        q = self.pos_embed[:, [0]]
+        q = self.pos_basis.view(1, 1, -1)
         ctx = self.get_token_embedding(idx)  # the context vector is just null context
         ctx = norm(ctx)
 
         # due to PARSeq's implementation, when q.shape[-1] = 1, cos[1] and sin[1] are q and cos[0] and sin[0] are for k
-        # but for null context vector, q and k use the same cos and sin
+        # but for null context vector, q and k use the same cos and sin (precisely no rotation)
+        # TODO: better put cos_sin=None since there is no rotation?
         cos = torch.concatenate([self.cos[:, [0]], self.cos[:, [0]]], dim=1)
         sin = torch.concatenate([self.sin[:, [0]], self.sin[:, [0]]], dim=1)
 
@@ -362,16 +363,20 @@ class TrorYongASRModel(nn.Module):
         idx = torch.as_tensor([self.prefix], dtype=torch.long, device=mels.device)
         n = idx.shape[1]
         idx_next = None
+        pos_basis = self.pos_basis.view(1, 1, -1)
         for i in range(n, n+max_tokens):
             if i == n:
-                q = self.pos_embed[:, :i]
+                # q = self.q_basis[:, :i]
+                q = pos_basis.expand(-1, n, -1)
                 ctx = self.get_token_embedding(idx)
-                ctx = torch.concatenate([ctx[:, [0]], ctx[:, 1:] + self.pos_embed[:, :i-1]], dim=1)
+                # ctx = torch.concatenate([ctx[:, [0]], ctx[:, 1:] + self.q_basis[:, :i-1]], dim=1)
                 cos_sin = self.cos[:, :i], self.sin[:, :i]
                 mask = self.mask[:i, :i]
             else:
-                q = self.pos_embed[:, [i-1]]
-                ctx = self.get_token_embedding(idx_next) + self.pos_embed[:, [i-2]]
+                # q = self.q_basis[:, [i-1]]
+                q = pos_basis
+                # ctx = self.get_token_embedding(idx_next) + self.q_basis[:, [i-2]]
+                ctx = self.get_token_embedding(idx_next)
                 cos_sin = self.cos[:, i-2:i], self.sin[:, i-2:i]
                 mask = self.mask[[i-1], :i]
             ctx = norm(ctx)
@@ -379,10 +384,10 @@ class TrorYongASRModel(nn.Module):
             # q_proj, k_proj, v_proj = self.decoder.self_attn.qkv_projection(norm(q), ctx, ctx, cos_sin, kv_cache=kv_cache)
             # res = self.decoder.forward_self_attn(q, q_proj, k_proj, v_proj, mask)
             # NOTE: The 2 lines below are equivalent to the 2 lines above
-            query, sa_weights = self.decoder.self_attn(norm(q), ctx, ctx, cos_sin, mask, key_padding_mask=None, kv_cache=kv_cache)
+            query, sa_weights = self.decoder.self_attn(norm(q), ctx, ctx, cos_sin, mask, kv_cache=kv_cache)
             res = q + query
 
-            res_q_proj = self.decoder.cross_attn.q_projection(norm(res), cos_sin)
+            res_q_proj = self.decoder.cross_attn.q_projection(norm(res))
             res = self.decoder.forward_cross_attn_and_mlp(res, res_q_proj, aud_k_proj, aud_v_proj)
 
             logits = self.lm_head(norm(res[:, [-1], :])).float()
@@ -404,37 +409,37 @@ class TrorYongASRModel(nn.Module):
 
     @torch.no_grad()
     def init_weights(self):
-        torch.nn.init.normal_(self.encoder.conv1.weight, mean=0.0, std=0.02)
-        torch.nn.init.normal_(self.encoder.conv2.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.encoder.conv1.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.encoder.conv2.weight, mean=0.0, std=0.02)
 
         n_embed = self.config.n_embed
         s = 3**0.5 * n_embed**-0.5
         for block in self.encoder.blocks:
-            torch.nn.init.uniform_(block.attn.query.weight, -s, s)
-            torch.nn.init.uniform_(block.attn.key.weight, -s, s)
-            torch.nn.init.uniform_(block.attn.value.weight, -s, s)
-            torch.nn.init.zeros_(block.attn.out.weight)
-            torch.nn.init.uniform_(block.mlp[0].weight, -s * 0.4, s * 0.4)
-            torch.nn.init.zeros_(block.mlp[2].weight)
+            nn.init.uniform_(block.attn.query.weight, -s, s)
+            nn.init.uniform_(block.attn.key.weight, -s, s)
+            nn.init.uniform_(block.attn.value.weight, -s, s)
+            nn.init.zeros_(block.attn.out.weight)
+            nn.init.uniform_(block.mlp[0].weight, -s * 0.4, s * 0.4)
+            nn.init.zeros_(block.mlp[2].weight)
 
-        torch.nn.init.uniform_(self.decoder.self_attn.q_proj.weight, -s, s)
-        torch.nn.init.uniform_(self.decoder.self_attn.k_proj.weight, -s, s)
-        torch.nn.init.uniform_(self.decoder.self_attn.v_proj.weight, -s, s)
-        torch.nn.init.zeros_(self.decoder.self_attn.out_proj.weight)
-        torch.nn.init.uniform_(self.decoder.cross_attn.q_proj.weight, -s, s)
-        torch.nn.init.uniform_(self.decoder.cross_attn.k_proj.weight, -s, s)
-        torch.nn.init.uniform_(self.decoder.cross_attn.v_proj.weight, -s, s)
-        torch.nn.init.zeros_(self.decoder.cross_attn.out_proj.weight)
-        torch.nn.init.uniform_(self.decoder.mlp.gate_proj.weight, -s * 0.4, s * 0.4)
-        torch.nn.init.uniform_(self.decoder.mlp.up_proj.weight, -s * 0.4, s * 0.4)
-        torch.nn.init.zeros_(self.decoder.mlp.down_proj.weight)
+        nn.init.uniform_(self.decoder.self_attn.q_proj.weight, -s, s)
+        nn.init.uniform_(self.decoder.self_attn.k_proj.weight, -s, s)
+        nn.init.uniform_(self.decoder.self_attn.v_proj.weight, -s, s)
+        nn.init.zeros_(self.decoder.self_attn.out_proj.weight)
+        nn.init.uniform_(self.decoder.cross_attn.q_proj.weight, -s, s)
+        nn.init.uniform_(self.decoder.cross_attn.k_proj.weight, -s, s)
+        nn.init.uniform_(self.decoder.cross_attn.v_proj.weight, -s, s)
+        nn.init.zeros_(self.decoder.cross_attn.out_proj.weight)
+        nn.init.uniform_(self.decoder.mlp.gate_proj.weight, -s * 0.4, s * 0.4)
+        nn.init.uniform_(self.decoder.mlp.up_proj.weight, -s * 0.4, s * 0.4)
+        nn.init.zeros_(self.decoder.mlp.down_proj.weight)
 
         # Embedding
-        torch.nn.init.normal_(self.tok_embed.weight, mean=0.0, std=0.001)
+        nn.init.normal_(self.tok_embed.weight, mean=0.0, std=0.001)
         # tie token embedding
         self.lm_head.weight = self.tok_embed.weight
 
-        nn.init.trunc_normal_(self.pos_embed, std=1.0)
+        nn.init.uniform_(self.pos_basis, -s, s)
 
         # Rotary embeddings
         cos, sin = precompute_rotary_emb(self.rotary_seq_len, self.head_dim, device=self.device)
@@ -444,4 +449,4 @@ class TrorYongASRModel(nn.Module):
 
         if self.tok_embed.weight.device.type == 'cuda':
             self.tok_embed.weight = self.tok_embed.weight.to(torch.bfloat16)
-            self.pos_embed = self.pos_embed.to(torch.bfloat16)
+            self.pos_basis = self.pos_basis.to(torch.bfloat16)
