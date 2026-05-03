@@ -53,13 +53,13 @@ class MultiheadAttention(nn.Module):
         """
         if self.is_ca:  # in this implementation, self MHA does not need q projection
             q = self.q_proj(q)
-        q = q.view(*q.shape[:2], self.n_head, -1)
+        q = norm(q.view(*q.shape[:2], self.n_head, -1))
+        q = q.permute(0, 2, 1, 3)
         if cos_sin is not None:
             cos, sin = cos_sin
+            cos, sin = cos[:, 1:].permute(0, 2, 1, 3), sin[:, 1:].permute(0, 2, 1, 3)
             # in this implementation, query has one rotation faster than key
-            q = apply_rotary_emb(q, cos[:, 1:], sin[:, 1:])
-        q = q.permute(0, 2, 1, 3)
-        q = norm(q)
+            q = apply_rotary_emb(q, cos, sin)
         return q
 
     def kv_projection(self, k, v, cos_sin=None, kv_cache=None):
@@ -67,14 +67,13 @@ class MultiheadAttention(nn.Module):
         Compute and return the projection of key and value
         """
         k = self.k_proj(k)
-        k = k.view(*k.shape[:2], self.n_head, -1)
+        k = norm(k.view(*k.shape[:2], self.n_head, -1))
+        k = k.permute(0, 2, 1, 3)
         if cos_sin is not None:  # cross attention does not apply rotary embedding
             cos, sin = cos_sin
+            cos, sin = cos[:, :-1].permute(0, 2, 1, 3), sin[:, :-1].permute(0, 2, 1, 3)
             # in this implementation, key has one rotation slower than query
-            k = apply_rotary_emb(k, cos[:, :-1], sin[:, :-1])
-        k = k.permute(0, 2, 1, 3)
-        k = norm(k)
-
+            k = apply_rotary_emb(k, cos, sin)
         v = self.v_proj(v)
         v = v.view(*v.shape[:2], self.n_head, -1)
         v = v.permute(0, 2, 1, 3)
