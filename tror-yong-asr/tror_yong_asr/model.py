@@ -221,7 +221,7 @@ class TrorYongASRModel(nn.Module):
         self.vocab_size = config.vocab_size
         self.pad_vocab_size = (config.vocab_size + 63) // 64 * 64
         self.tok_embed = nn.Embedding(self.pad_vocab_size, config.n_embed, padding_idx=self.config.pad_id)
-        self.pos_query = nn.Parameter(torch.Tensor(config.n_embed))
+        self.pos_basis = nn.Parameter(torch.Tensor(config.n_embed))
         self.dropout = nn.Dropout(config.dropout)
         self.decoder = DecoderBlock(config.n_embed, self.n_head, config.n_embed * 4, config.dropout, config.bias)
         self.lm_head = LinearWrapper(config.n_embed, self.pad_vocab_size, bias=False)
@@ -257,7 +257,7 @@ class TrorYongASRModel(nn.Module):
         # NOTE: in Whisper Audio Encoder, the audio encoding is already normalized by ln_post()
         aud = self.encoder(mels)
 
-        q = self.pos_query.view(1, 1, -1).expand(b, L, -1)
+        q = self.pos_basis.view(1, 1, -1).expand(b, L, -1)
         ctx = self.get_token_embedding(input_ids)
         ctx = self.dropout(ctx)
         ctx = norm(ctx)
@@ -304,16 +304,7 @@ class TrorYongASRModel(nn.Module):
         aud = self.encoder(mels)
 
         idx = torch.as_tensor([[tokenizer.sot]], dtype=torch.long, device=self.device)
-        q = self.pos_query.view(1, 1, -1)
-        ctx = self.get_token_embedding(idx)  # the context vector is just null context
-        ctx = norm(ctx)
-
-        # due to PARSeq's implementation, q has one shift in rotation compare to k
-        cos_sin = self.cos[:, :2], self.sin[:, :2]
-
-        attn_mask = self.mask[[0], [0]]
-        res = self.decoder(q, ctx, aud, cos_sin, attn_mask)
-        logits = self.lm_head(norm(res)).float()
+        logits = self.forward(mels, idx).logits
 
         # suppress non-language tokens
         mask = torch.ones(logits.shape[-1], dtype=torch.bool)
@@ -355,7 +346,7 @@ class TrorYongASRModel(nn.Module):
         idx = torch.as_tensor([self.prefix], dtype=torch.long, device=mels.device)
         n = idx.shape[1]
         idx_next = None
-        pos_query = self.pos_query.view(1, 1, -1)
+        pos_query = self.pos_basis.view(1, 1, -1)
         for i in range(n, n+max_tokens):
             if i == n:
                 q = pos_query.expand(-1, i, -1)
@@ -427,8 +418,7 @@ class TrorYongASRModel(nn.Module):
         # tie token embedding
         self.lm_head.weight = self.tok_embed.weight
 
-        # nn.init.orthogonal_(self.pos_query)
-        nn.init.trunc_normal_(self.pos_query, std=1.0)
+        nn.init.trunc_normal_(self.pos_basis, std=1.0)
 
         # Rotary embeddings
         cos, sin = precompute_rotary_emb(self.rotary_seq_len, self.head_dim, device=self.device)
