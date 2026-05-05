@@ -15,6 +15,7 @@ from safetensors.torch import load_model
 import math
 from .nn_utils import (
     precompute_rotary_emb,
+    DerfWrapper,
     norm,
     apply_rotary_emb,
     MLP,
@@ -144,7 +145,9 @@ class DecoderBlock(nn.Module):
         super().__init__()
         self.self_attn = MultiheadAttention(d_model, nhead, dropout, bias)
         self.cross_attn = MultiheadAttention(d_model, nhead, dropout, bias, is_ca=True)
+        self.ca_norm = DerfWrapper(d_model)
         self.mlp = MLP(d_model, dim_feedforward, dropout, bias)
+        self.mlp_norm = DerfWrapper(d_model)
 
     def forward_self_attn(self, q, q_proj, k_proj, v_proj, attn_mask, key_padding_mask=None):
         """
@@ -160,7 +163,7 @@ class DecoderBlock(nn.Module):
         """
         query, ca_weights = self.cross_attn.attention_forward(q_proj, k_proj, v_proj)
         res = res + query
-        res = res + self.mlp(norm(res))
+        res = res + self.mlp(self.mlp_norm(res))
         return res
 
     def forward(self, q, ctx, aud, cos_sin, attn_mask, key_padding_mask=None, kv_cache=None):
@@ -168,13 +171,13 @@ class DecoderBlock(nn.Module):
         regular forward pass
         WARN: q must be unnormalized in order to do residual connection
         """
+        # NOTE: q is not normalized when passing to self_attn because it is q_projection already, and I only apply rotation.
         # query, sa_weights = self.self_attn(norm(q), ctx, ctx, cos_sin, attn_mask, key_padding_mask, kv_cache)
-        # q is unnormalized cuz it is q_projection already, and I only apply rotation
         query, sa_weights = self.self_attn(q, ctx, ctx, cos_sin, attn_mask, key_padding_mask, kv_cache)
         res = q.clone() + query
-        query, ca_weights = self.cross_attn(norm(res), aud, aud)
+        query, ca_weights = self.cross_attn(self.ca_norm(res), aud, aud)
         res = res + query
-        res = res + self.mlp(norm(res))
+        res = res + self.mlp(self.mlp_norm(res))
         return res
 
 
@@ -218,7 +221,6 @@ class TrorYongASRModel(nn.Module):
         self.vocab_size = config.vocab_size
         self.pad_vocab_size = (config.vocab_size + 63) // 64 * 64
         self.tok_embed = nn.Embedding(self.pad_vocab_size, config.n_embed, padding_idx=self.config.pad_id)
-        # self.pos_query = nn.Parameter(torch.Tensor(self.n_head, self.head_dim))
         self.pos_query = nn.Parameter(torch.Tensor(config.n_embed))
         self.dropout = nn.Dropout(config.dropout)
         self.decoder = DecoderBlock(config.n_embed, self.n_head, config.n_embed * 4, config.dropout, config.bias)
@@ -252,8 +254,8 @@ class TrorYongASRModel(nn.Module):
         b, L = input_ids.size()
         assert L <= self.config.n_text_ctx, "input_ids is too long"
 
+        # NOTE: in Whisper Audio Encoder, the audio encoding is already normalized by ln_post()
         aud = self.encoder(mels)
-        aud = norm(aud)
 
         q = self.pos_query.view(1, 1, -1).expand(b, L, -1)
         ctx = self.get_token_embedding(input_ids)
@@ -299,7 +301,7 @@ class TrorYongASRModel(nn.Module):
         NOTE: I could have called `forward` but there is a careful attention required for cos, sin
         """
         mels = mels.unsqueeze(0)
-        aud = norm(self.encoder(mels))
+        aud = self.encoder(mels)
 
         idx = torch.as_tensor([[tokenizer.sot]], dtype=torch.long, device=self.device)
         q = self.pos_query.view(1, 1, -1)
@@ -348,7 +350,6 @@ class TrorYongASRModel(nn.Module):
 
         mels = mels.unsqueeze(0)
         aud = self.encoder(mels)
-        aud = norm(aud)
         aud_k_proj, aud_v_proj = self.decoder.cross_attn.kv_projection(aud, aud)
 
         idx = torch.as_tensor([self.prefix], dtype=torch.long, device=mels.device)
@@ -371,11 +372,11 @@ class TrorYongASRModel(nn.Module):
             # q_proj, k_proj, v_proj = self.decoder.self_attn.qkv_projection(norm(q), ctx, ctx, cos_sin, kv_cache=kv_cache)
             # res = self.decoder.forward_self_attn(q, q_proj, k_proj, v_proj, mask)
             # NOTE: The 2 lines below are equivalent to the 2 lines above
-            # q is not normalized because it is q_projectioin already and I only apply rotation
+            # q is not normalized because it is q_projectioin already and I only apply rotation.
             query, sa_weights = self.decoder.self_attn(q, ctx, ctx, cos_sin, mask, kv_cache=kv_cache)
             res = q.clone() + query
 
-            res_q_proj = self.decoder.cross_attn.q_projection(norm(res))
+            res_q_proj = self.decoder.cross_attn.q_projection(self.decoder.ca_norm(res))
             res = self.decoder.forward_cross_attn_and_mlp(res, res_q_proj, aud_k_proj, aud_v_proj)
 
             logits = self.lm_head(norm(res[:, [-1], :])).float()
