@@ -62,6 +62,36 @@ class Conv1dWrapper(nn.Conv1d):
         )
 
 
+class Dynamic_erf(nn.Module):
+    """
+    Taken from https://github.com/zlab-princeton/Derf/blob/main/speech%20model/dynamic_erf.patch
+    """
+
+    def __init__(self, normalized_shape, alpha_init_value=0.5, shift_init_value=0.0):
+        super().__init__()
+        self.normalized_shape = normalized_shape
+        self.alpha_init_value = alpha_init_value
+        self.shift_init_value = shift_init_value
+
+        self.alpha = nn.Parameter(torch.ones(1) * alpha_init_value)
+        self.shift = nn.Parameter(torch.ones(1) * shift_init_value)
+        self.weight = nn.Parameter(torch.ones(normalized_shape))
+        self.bias = nn.Parameter(torch.zeros(normalized_shape))
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = torch.erf(self.alpha * x + self.shift)
+        x = x * self.weight + self.bias
+        return x
+
+    def extra_repr(self):
+        return f"normalized_shape={self.normalized_shape}, alpha_init_value={self.alpha_init_value}, shift_init_value={self.shift_init_value}"
+
+
+class DerfWrapper(Dynamic_erf):
+    def forward(self, x: Tensor) -> Tensor:
+        return super().forward(x.float()).type(x.dtype)
+
+
 class Conv1D(nn.Module):
     """
     Taken from https://github.com/huggingface/transformers/blob/main/src/transformers/pytorch_utils.py#L97
