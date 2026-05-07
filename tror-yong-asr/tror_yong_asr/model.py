@@ -29,8 +29,6 @@ from .whisper_audio_encoder import AudioEncoder
 PRETRAINED_MODEL = [
     "KrorngAI/TrorYongASR-tiny",
     "KrorngAI/TrorYongASR-small",
-    "Kimang18/tror-yong-asr-tiny",  # for testing TODO: remove this before publish
-    "Kimang18/tror-yong-asr-small"  # for testing TODO: remove this before publish
 ]
 
 

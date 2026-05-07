@@ -8,6 +8,24 @@ from ._version import __version__
 TaskOutput = namedtuple("TaskOutput", "output_ids text")
 
 
+def detect_language(file_name: str, model: TrorYongASRModel, processor):
+    """
+    Args:
+    file_name: file path to audio (tested with mp3, but m4a or wav are not tested yet)
+    """
+    # load audio directly to a tensor
+    waveform, sample_rate = torchaudio.load(file_name)
+    # resample if necessary (my model excepts 16kHz)
+    if sample_rate != 16000:
+        resampler = torchaudio.transforms.Resample(sample_rate, 16000)
+        waveform = resampler(waveform)
+    audio_array = waveform.squeeze().numpy()  # 1D-array
+
+    mels = processor(audio_array, sampling_rate=16000, return_tensors="pt").input_features[0]  # (80, 3000)
+
+    return model.detect_language(mels, processor.tokenizer)
+
+
 def _task_handling(file_name: str, model: TrorYongASRModel, processor, task: str, max_tokens: int, temperature=1.0, top_k=None, seed=168, verbose=False) -> TaskOutput:
     """
     Args:
