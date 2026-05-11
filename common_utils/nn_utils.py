@@ -6,6 +6,7 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 from torch import nn, Tensor
+from torch.cuda.amp import autocast
 
 
 def precompute_rotary_emb(seq_len, head_dim, device, base=10000):
@@ -36,30 +37,38 @@ def apply_rotary_emb(x, cos, sin):
 
 class LinearWrapper(nn.Linear):
     def forward(self, x: Tensor) -> Tensor:
-        return F.linear(
-            x,
-            self.weight.to(x.dtype),
-            None if self.bias is None else self.bias.to(x.dtype)
-        )
+        with autocast(enabled=True):
+            return super().forward(x)
+        # return F.linear(
+        #     x,
+        #     self.weight.to(x.dtype),
+        #     None if self.bias is None else self.bias.to(x.dtype)
+        # )
 
 
 class LayerNormWrapper(nn.LayerNorm):
     def forward(self, x: Tensor) -> Tensor:
-        return super().forward(x.float()).type(x.dtype)
+        with autocast(enabled=True):
+            return super().forward(x)
+        # return super().forward(x.float()).type(x.dtype)
 
 
 class RMSNormWrapper(nn.RMSNorm):
     def forward(self, x: Tensor) -> Tensor:
-        return super().forward(x.float()).type(x.dtype)
+        with autocast(enabled=True):
+            return super().forward(x)
+        # return super().forward(x.float()).type(x.dtype)
 
 
 class Conv1dWrapper(nn.Conv1d):
     def _conv_forward(
         self, x: Tensor, weight: Tensor, bias: Optional[Tensor]
     ) -> Tensor:
-        return super()._conv_forward(
-            x, weight.to(x.dtype), None if bias is None else bias.to(x.dtype)
-        )
+        with autocast(enabled=True):
+            return super()._conv_forward(x)
+        # return super()._conv_forward(
+        #     x, weight.to(x.dtype), None if bias is None else bias.to(x.dtype)
+        # )
 
 
 class Dynamic_erf(nn.Module):
@@ -89,7 +98,9 @@ class Dynamic_erf(nn.Module):
 
 class DerfWrapper(Dynamic_erf):
     def forward(self, x: Tensor) -> Tensor:
-        return super().forward(x.float()).type(x.dtype)
+        with autocast(enabled=True):
+            return super().forward(x)
+        # return super().forward(x.float()).type(x.dtype)
 
 
 class Conv1D(nn.Module):

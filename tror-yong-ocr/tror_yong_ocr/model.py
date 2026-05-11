@@ -9,41 +9,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 from .tokenizer import get_tokenizer
-
-
-def norm(x):
-    return F.rms_norm(x, (x.size(-1), ))
-
-
-def precompute_rotary_emb(seq_len, head_dim, device, base=10000):
-    channel_range = torch.arange(0, head_dim, 2, dtype=torch.float32, device=device)
-    inv_freq = 1.0 / (base ** (channel_range / head_dim))
-    t = torch.arange(seq_len, dtype=torch.float32, device=device)
-    freqs = torch.outer(t, inv_freq)
-    cos, sin = freqs.cos(), freqs.sin()
-    cos, sin = cos.bfloat16(), sin.bfloat16()
-    cos, sin = cos[None, :, None, :], sin[None, :, None, :]
-    return cos, sin
-
-
-def apply_rotary_emb(x, cos, sin):
-    assert x.ndim == 4  # multihead attention
-    d = x.shape[3] // 2
-    x1, x2 = x[..., :d], x[..., d:]  # split up last time into two halves
-    y1 = x1 * cos + x2 * sin  # rotate pairs of dims
-    y2 = x1 * (-sin) + x2 * cos
-    out = torch.cat([y1, y2], 3)  # re-assemble
-    out = out.to(x.dtype)  # ensure input/output dtypes match
-    return out
-
-
-class Linear(nn.Linear):
-    def forward(self, x: Tensor) -> Tensor:
-        return F.linear(
-            x,
-            self.weight.to(x.dtype),
-            None if self.bias is None else self.bias.to(x.dtype)
-        )
+from .nn_utils import (
+    precompute_rotary_emb,
+    DerfWrapper,
+    norm,
+    apply_rotary_emb,
+    MLP,
+    LinearWrapper,
+    KVCache
+)
+from .common import print_banner
 
 
 class Conv2d(nn.Conv2d):
@@ -66,75 +41,16 @@ class PatchEmbedding(nn.Module):
         return x
 
 
-class FeedForward(nn.Module):
-    def __init__(self, n_embed, dim_feedforward, dropout=0.0, bias=True):
-        super().__init__()
-        self.gate_proj = Linear(n_embed, dim_feedforward, bias=bias)
-        self.up_proj = Linear(n_embed, dim_feedforward, bias=bias)
-        self.down_proj = Linear(dim_feedforward, n_embed, bias=bias)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x):
-        x_up = self.up_proj(x)
-        x = F.silu(self.gate_proj(x))
-        x = x * x_up
-        x = self.dropout(self.down_proj(x))
-        return x
-
-
-class KVCache:
-    """
-    Handle only one image at a time (batch_size=1)
-    """
-
-    def __init__(self, num_heads, seq_len, head_dim):
-        self.kv_shape = (1, 2, num_heads, seq_len, head_dim)
-        self.kv_cache = None
-        self.pos = 0
-
-    def get_pos(self):
-        return self.pos
-
-    def insert_kv(self, k, v):
-        # Lazy initialize the cache here because we need to know the dtype/device
-        if self.kv_cache is None:
-            self.kv_cache = torch.empty(self.kv_shape, dtype=k.dtype, device=k.device)
-
-        b, n_head, L_add, head_dim = k.size()
-        l0, l1 = self.pos, self.pos + L_add
-        # Dynamically grow the cache if needed
-        if l1 > self.kv_cache.size(3):
-            l_needed = l1 + 1024  # as much as we need plus buffer of 1024
-            # then round up to the nearest multiple of 1024
-            l_needed = (l_needed + 1023) & ~1023
-            additional_shape = list(self.kv_cache.shape)
-            additional_shape[3] = l_needed - self.kv_cache.size(3)
-            additional_cache = torch.empty(additional_shape, dtype=k.dtype, device=k.device)
-            self.kv_cache = torch.cat([self.kv_cache, additional_cache], dim=3).contiguous()
-            self.kv_shape = self.kv_cache.shape
-
-        # Insert k, v into the cache
-        self.kv_cache[:, 0, :, l0:l1, :] = k
-        self.kv_cache[:, 1, :, l0:l1, :] = v
-        # Return the full cached key/values up to current position (as a view)
-        key_view = self.kv_cache[:, 0, :, :l1, :]
-        val_view = self.kv_cache[:, 1, :, :l1, :]
-
-        # Increment pos after the text decoder layer processes
-        self.pos = l1
-        return key_view, val_view
-
-
 class MultiheadAttention(nn.Module):
     def __init__(self, n_embed, n_head, dropout=0.0, bias=True):
         super().__init__()
         self.n_embed = n_embed
         self.n_head = n_head
         self.dropout = nn.Dropout(dropout)
-        self.q_proj = Linear(n_embed, n_embed, bias=bias)
-        self.k_proj = Linear(n_embed, n_embed, bias=bias)
-        self.v_proj = Linear(n_embed, n_embed, bias=bias)
-        self.out_proj = Linear(n_embed, n_embed, bias=bias)
+        self.q_proj = LinearWrapper(n_embed, n_embed, bias=bias)
+        self.k_proj = LinearWrapper(n_embed, n_embed, bias=bias)
+        self.v_proj = LinearWrapper(n_embed, n_embed, bias=bias)
+        self.out_proj = LinearWrapper(n_embed, n_embed, bias=bias)
 
     def forward(self, query, key, value, attn_mask, cos_sin=None, kv_cache=None):
         b, t, _ = query.size()
@@ -144,13 +60,13 @@ class MultiheadAttention(nn.Module):
         q = q.view(*q.shape[:2], self.n_head, -1)
         k = k.view(*k.shape[:2], self.n_head, -1)
         v = v.view(*v.shape[:2], self.n_head, -1)
+        q, k = norm(q), norm(k)
         if cos_sin is not None:
             cos, sin = cos_sin
             q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
-        q, k = norm(q), norm(k)
         q, k, v = q.permute(0, 2, 1, 3), k.permute(0, 2, 1, 3), v.permute(0, 2, 1, 3)
         if kv_cache is not None:
-            k, v = kv_cache.insert_kv(k, v)
+            k, v = kv_cache.insert_kv(0, k, v)
         qkv = F.scaled_dot_product_attention(q, k, v, dropout_p=self.dropout.p, attn_mask=attn_mask, is_causal=False)
         qkv = qkv.permute(0, 2, 1, 3).flatten(start_dim=2)
         return self.dropout(self.out_proj(qkv)), _
@@ -163,7 +79,7 @@ class ResidualAttentionBlock(nn.Module):
         self.n_head = nhead
         self.head_dim = d_model // nhead
         self.mha = MultiheadAttention(d_model, nhead, dropout=dropout, bias=bias)
-        self.ffn = FeedForward(d_model, dim_feedforward, dropout, bias)
+        self.ffn = MLP(d_model, dim_feedforward, dropout, bias)
 
     def forward(self, x, img_enc=None, src_mask=None, cos_sin=None, kv_cache=None):
         """
@@ -220,7 +136,7 @@ class TrorYongOCR(nn.Module):
             dropout=config.dropout,
             bias=config.bias
         )
-        self.lm_head = Linear(config.n_embed, config.vocab_size)
+        self.lm_head = LinearWrapper(config.n_embed, config.vocab_size)
 
         mask = torch.tril(torch.ones((self.n_patch+config.block_size, self.n_patch+config.block_size), dtype=torch.bool))
         self.register_buffer("mask", mask)
@@ -289,7 +205,7 @@ class TrorYongOCR(nn.Module):
 
         seq_len = self.mask.shape[0]
         assert max_tokens <= seq_len, "too long sequence generation, consider lower max_tokens"
-        kv_cache = KVCache(self.config.n_head, seq_len, self.head_dim)
+        kv_cache = KVCache(1, self.config.n_head, seq_len, self.head_dim, 1)
 
         idx = torch.full((1,1), fill_value=self.tokenizer.bos_id, dtype=torch.long, device=img_tensor.device)
         idx_next = None
