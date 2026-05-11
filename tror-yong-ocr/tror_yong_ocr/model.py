@@ -78,8 +78,10 @@ class ResidualAttentionBlock(nn.Module):
         self.n_embed = d_model
         self.n_head = nhead
         self.head_dim = d_model // nhead
-        self.mha = MultiheadAttention(d_model, nhead, dropout=dropout, bias=bias)
-        self.ffn = MLP(d_model, dim_feedforward, dropout, bias)
+        self.sa = MultiheadAttention(d_model, nhead, dropout=dropout, bias=bias)
+        self.sa_norm = DerfWrapper(d_model)
+        self.mlp = MLP(d_model, dim_feedforward, dropout, bias)
+        self.mlp_norm = DerfWrapper(d_model)
 
     def forward(self, x, img_enc=None, src_mask=None, cos_sin=None, kv_cache=None):
         """
@@ -87,14 +89,16 @@ class ResidualAttentionBlock(nn.Module):
         img_enc: image encoding (b, n_patch, n_embed)
         src_mask: attention mask (L, n_patch + L)
         """
-        x_norm = norm(x)
+        # x_norm = norm(x)
+        x_norm = self.sa_norm(x)
         if img_enc is None:
             memory = x_norm
         else:
-            memory = torch.cat([norm(img_enc), x_norm], dim=1)
+            # memory = torch.cat([norm(img_enc), x_norm], dim=1)
+            memory = torch.cat([self.sa_norm(img_enc), x_norm], dim=1)
 
-        x = x + self.mha(x_norm, memory, memory, src_mask, cos_sin, kv_cache)[0]
-        x = x + self.ffn(norm(x))
+        x = x + self.sa(x_norm, memory, memory, src_mask, cos_sin, kv_cache)[0]
+        x = x + self.mlp(self.mlp_norm(x))
         return x
 
 
