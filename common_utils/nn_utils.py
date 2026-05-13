@@ -14,8 +14,9 @@ def precompute_rotary_emb(seq_len, head_dim, device, base=10000):
     t = torch.arange(seq_len, dtype=torch.float32, device=device)
     freqs = torch.outer(t, inv_freq)
     cos, sin = freqs.cos(), freqs.sin()
-    cos, sin = cos.bfloat16(), sin.bfloat16()
-    cos, sin = cos[None, :, None, :], sin[None, :, None, :]
+    # cos, sin = cos.bfloat16(), sin.bfloat16()
+    # cos, sin = cos.half(), sin.half()  # stored in float16 for 16-mixed
+    cos, sin = cos[None, None, :, :], sin[None, None, :, :]
     return cos, sin
 
 

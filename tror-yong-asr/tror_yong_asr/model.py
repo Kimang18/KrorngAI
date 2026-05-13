@@ -1,5 +1,14 @@
 # Author: KrorngAI org.
 # Date: March 2026
+"""
+Features:
+- exclusive self-attention
+- text decoder with a single transformer block
+- RoPE in text decoder
+- Dynamic Error Function instead of normalization layer in text decoder
+- SiLU gate in MLP of transformer
+- QK-normalization before attention mechanism
+"""
 
 
 from typing import Optional, List
@@ -52,11 +61,11 @@ class MultiheadAttention(nn.Module):
         """
         if self.is_ca:  # in this implementation, self MHA does not need q projection
             q = self.q_proj(q)
-        q = norm(q.view(*q.shape[:2], self.n_head, -1))
-        q = q.permute(0, 2, 1, 3)
+        q = q.view(*q.shape[:2], self.n_head, -1).permute(0, 2, 1, 3)
+        q = norm(q)
         if cos_sin is not None:
             cos, sin = cos_sin
-            cos, sin = cos[:, 1:].permute(0, 2, 1, 3), sin[:, 1:].permute(0, 2, 1, 3)
+            cos, sin = cos[:, :, 1:], sin[:, :, 1:]
             # in this implementation, query has one rotation faster than key
             q = apply_rotary_emb(q, cos, sin)
         return q
@@ -66,16 +75,15 @@ class MultiheadAttention(nn.Module):
         Compute and return the projection of key and value
         """
         k = self.k_proj(k)
-        k = norm(k.view(*k.shape[:2], self.n_head, -1))
-        k = k.permute(0, 2, 1, 3)
+        k = k.view(*k.shape[:2], self.n_head, -1).permute(0, 2, 1, 3)
+        k = norm(k)
         if cos_sin is not None:  # cross attention does not apply rotary embedding
             cos, sin = cos_sin
-            cos, sin = cos[:, :-1].permute(0, 2, 1, 3), sin[:, :-1].permute(0, 2, 1, 3)
+            cos, sin = cos[:, :, :-1], sin[:, :, :-1]
             # in this implementation, key has one rotation slower than query
             k = apply_rotary_emb(k, cos, sin)
         v = self.v_proj(v)
-        v = v.view(*v.shape[:2], self.n_head, -1)
-        v = v.permute(0, 2, 1, 3)
+        v = v.view(*v.shape[:2], self.n_head, -1).permute(0, 2, 1, 3)
         if kv_cache is not None:  # only self_attn use kv_cache
             k, v = kv_cache.insert_kv(0, k, v)  # there is only one layer, so layer_idx=0
         return k, v
@@ -219,7 +227,8 @@ class TrorYongASRModel(nn.Module):
         self.vocab_size = config.vocab_size
         self.pad_vocab_size = (config.vocab_size + 63) // 64 * 64
         self.tok_embed = nn.Embedding(self.pad_vocab_size, config.n_embed, padding_idx=self.config.pad_id)
-        self.pos_basis = nn.Parameter(torch.Tensor(config.n_embed))
+        # self.pos_basis = nn.Parameter(Tensor(config.n_embed))
+        self.pos_basis = nn.Parameter(Tensor(self.n_head, self.head_dim))
         self.dropout = nn.Dropout(config.dropout)
         self.decoder = DecoderBlock(config.n_embed, self.n_head, config.n_embed * 4, config.dropout, config.bias)
         self.lm_head = LinearWrapper(config.n_embed, self.pad_vocab_size, bias=False)
@@ -256,11 +265,14 @@ class TrorYongASRModel(nn.Module):
         aud = self.encoder(mels)
 
         q = self.pos_basis.view(1, 1, -1).expand(b, L, -1)
+        # TODO: I want to improve WER by adding q to ctx
+        # The model consequently learns faster but TER, CER, and WER on test set
+        # are not improved. Further dev. is to choose pos_basis independently for each position
         ctx = self.get_token_embedding(input_ids)
         ctx = self.dropout(ctx)
         ctx = norm(ctx)
 
-        cos_sin = self.cos[:, :L+1], self.sin[:, :L+1]
+        cos_sin = self.cos[:, :, :L+1], self.sin[:, :, :L+1]
 
         attn_mask = self.mask[:L, :L]
         res = self.decoder(q, ctx, aud, cos_sin, attn_mask)
@@ -299,7 +311,6 @@ class TrorYongASRModel(nn.Module):
         NOTE: I could have called `forward` but there is a careful attention required for cos, sin
         """
         mels = mels.unsqueeze(0)
-        aud = self.encoder(mels)
 
         idx = torch.as_tensor([[tokenizer.sot]], dtype=torch.long, device=self.device)
         logits = self.forward(mels, idx).logits
@@ -349,12 +360,12 @@ class TrorYongASRModel(nn.Module):
             if i == n:
                 q = pos_query.expand(-1, i, -1)
                 ctx = self.get_token_embedding(idx)
-                cos_sin = self.cos[:, :i+1], self.sin[:, :i+1]
+                cos_sin = self.cos[:, :, :i+1], self.sin[:, :, :i+1]
                 mask = self.mask[:i, :i]
             else:
                 q = pos_query
                 ctx = self.get_token_embedding(idx_next)
-                cos_sin = self.cos[:, i-1:i+1], self.sin[:, i-1:i+1]
+                cos_sin = self.cos[:, :, i-1:i+1], self.sin[:, :, i-1:i+1]
                 mask = self.mask[[i-1], :i]
             ctx = norm(ctx)
 
@@ -414,9 +425,11 @@ class TrorYongASRModel(nn.Module):
         # Embedding
         nn.init.normal_(self.tok_embed.weight, mean=0.0, std=0.001)
         # tie token embedding
-        self.lm_head.weight = self.tok_embed.weight
+        if self.config.tie_word_embeddings:
+            self.lm_head.weight = self.tok_embed.weight
 
-        nn.init.trunc_normal_(self.pos_basis, std=1.0)
+        # nn.init.trunc_normal_(self.pos_basis, std=1.0)
+        nn.init.orthogonal_(self.pos_basis)
 
         # Rotary embeddings
         cos, sin = precompute_rotary_emb(self.rotary_seq_len, self.head_dim, device=self.device)
@@ -424,6 +437,6 @@ class TrorYongASRModel(nn.Module):
 
         self.mask = torch.empty(self.config.n_text_ctx, self.config.n_text_ctx).fill_(-float('inf')).triu_(1)
 
-        if self.tok_embed.weight.device.type == 'cuda':
-            self.tok_embed.weight = self.tok_embed.weight.to(torch.bfloat16)
-            self.pos_basis = self.pos_basis.to(torch.bfloat16)
+        # if self.tok_embed.weight.device.type == 'cuda':
+        #     self.tok_embed.weight = self.tok_embed.weight.to(torch.bfloat16)
+        #     self.pos_basis = self.pos_basis.to(torch.bfloat16)
