@@ -11,16 +11,14 @@ Features:
 """
 
 
-from typing import Optional, List
+from typing import List
 from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from transformers import AutoConfig
 from transformers.modeling_outputs import CausalLMOutput
-from huggingface_hub import hf_hub_download
-from safetensors.torch import load_model
+from huggingface_hub import PyTorchModelHubMixin
 import math
 from .nn_utils import (
     precompute_rotary_emb,
@@ -33,12 +31,6 @@ from .nn_utils import (
 )
 from .common import print_banner
 from .whisper_audio_encoder import AudioEncoder
-
-
-PRETRAINED_MODEL = [
-    "KrorngAI/TrorYongASR-tiny",
-    "KrorngAI/TrorYongASR-small",
-]
 
 
 class MultiheadAttention(nn.Module):
@@ -203,8 +195,11 @@ class TrorYongASRConfig:
     tie_word_embeddings: bool = True
 
 
-class TrorYongASRModel(nn.Module):
-    def __init__(self, config, verbose=True) -> None:
+class TrorYongASRModel(
+    nn.Module,
+    PyTorchModelHubMixin
+):
+    def __init__(self, config: TrorYongASRConfig, verbose: bool=True) -> None:
         super().__init__()
         self.config = config
 
@@ -227,8 +222,8 @@ class TrorYongASRModel(nn.Module):
         self.vocab_size = config.vocab_size
         self.pad_vocab_size = (config.vocab_size + 63) // 64 * 64
         self.tok_embed = nn.Embedding(self.pad_vocab_size, config.n_embed, padding_idx=self.config.pad_id)
-        # self.pos_basis = nn.Parameter(Tensor(config.n_embed))
-        self.pos_basis = nn.Parameter(Tensor(self.n_head, self.head_dim))
+        self.pos_basis = nn.Parameter(Tensor(config.n_embed))
+        # self.pos_basis = nn.Parameter(Tensor(self.n_head, self.head_dim))
         self.dropout = nn.Dropout(config.dropout)
         self.decoder = DecoderBlock(config.n_embed, self.n_head, config.n_embed * 4, config.dropout, config.bias)
         self.lm_head = LinearWrapper(config.n_embed, self.pad_vocab_size, bias=False)
@@ -272,7 +267,7 @@ class TrorYongASRModel(nn.Module):
         ctx = self.dropout(ctx)
         ctx = norm(ctx)
 
-        cos_sin = self.cos[:, :, :L+1], self.sin[:, :, :L+1]
+        cos_sin = self.cos[:, :, :L+1], self.sin[:, :, :L+1] # L+1 because Q is one-shift faster than K
 
         attn_mask = self.mask[:L, :L]
         res = self.decoder(q, ctx, aud, cos_sin, attn_mask)
@@ -287,15 +282,6 @@ class TrorYongASRModel(nn.Module):
     @property
     def device(self):
         return self.encoder.conv1.weight.device
-
-    @classmethod
-    def from_pretrained(cls, model_id: str = "KrorngAI/TrorYongASR-tiny", verbose=True, trust_remote_code: Optional[bool]=None):
-        assert model_id in PRETRAINED_MODEL, f"Not supported repo, please check again. {model_id}"
-        config = AutoConfig.from_pretrained(model_id, trust_remote_code=trust_remote_code)
-        model = cls(config, verbose=verbose)
-        file_path = hf_hub_download(model_id, filename="model.safetensors")
-        load_model(model, file_path)
-        return model
 
     def set_prefix(self, prefix: List[int]):
         """
@@ -428,8 +414,8 @@ class TrorYongASRModel(nn.Module):
         if self.config.tie_word_embeddings:
             self.lm_head.weight = self.tok_embed.weight
 
-        # nn.init.trunc_normal_(self.pos_basis, std=1.0)
-        nn.init.orthogonal_(self.pos_basis)
+        nn.init.trunc_normal_(self.pos_basis, std=1.0)
+        # nn.init.orthogonal_(self.pos_basis)
 
         # Rotary embeddings
         cos, sin = precompute_rotary_emb(self.rotary_seq_len, self.head_dim, device=self.device)
