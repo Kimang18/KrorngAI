@@ -37,7 +37,7 @@ from tror_yong_asr import TrorYongASRModel, transcribe, translate, detect_langua
 
 model_id = "KrorngAI/TrorYongASR-tiny"
 processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
-model = TrorYongASRModel.from_pretrained(model_id, trust_remote_code=True)
+model = TrorYongASRModel.from_pretrained(model_id)
 
 result1 = detect_language('/path/to/audio_file.mp3', model, processor)
 print(result1)
@@ -80,4 +80,27 @@ TrorYongASR was evaluated on `test-split` of `google/fleurs` with code `km-kh` f
 
 # Fine-tune TrorYongASR
 
-To be added
+Below is the notebook of fine-tuning tutorial.
+
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Kimang18/rag-demo-with-mlx/blob/main/Finetune_TrorYongASR.ipynb)
+
+If you speak Khmer, you can watch my YouTube video explaining each step of the fine-tuning below.
+
+<a href="http://www.youtube.com/watch?feature=player_embedded&v=hohJ_ZVkYjg" target="_blank">
+ <img src="http://img.youtube.com/vi/hohJ_ZVkYjg/mqdefault.jpg" alt="Watch the video" height="240" border="1" />
+</a>
+
+**Note**: from version __v.1.1__ onward, you can use functions `push_to_hub`, `save_pretrained`, and `from_pretrained` like any models of `transformers`.
+
+```python
+from transformers import AutoProcessor
+from tror_yong_asr import TrorYongASRModel
+
+original_model_id="KrorngAI/TrorYongASR-tiny"
+processor = AutoProcessor.from_pretrained(original_model_id, trust_remote_code=True)
+model = TrorYongASRModel.from_pretrained(original_model_id)
+
+new_model_id="your_hf_repo"
+processor.push_to_hub(new_model_id)
+model.push_to_hub(new_model_id)
+```
