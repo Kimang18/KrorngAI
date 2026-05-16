@@ -103,7 +103,7 @@ The architecture of TrorYongOCR can be found in Figure 1 below.
 
 <figure>
   <div style="text-align: center;"><a name='architecture' ><img src="https://huggingface.co/KrorngAI/TrorYongOCR/resolve/main/figures/architecture.png" width="500" /></a></div>
-  <figcaption> Figure 1: TrorYongOCR architecture overview. The input image is transformed into patch embedding. Image embedding is obtained by additioning patch embedding and position embedding. The image embedding is passed through L-1 encoder blocks to generate image encoding (latent state). The image encoding is concatenated with character embedding (i.e. token embedding plus position embedding) before undergoing causal self-attention mechanism in the single decoder block to generate next token.</figcaption>
+  <figcaption> Figure 1: TrorYongOCR architecture overview. The input image is transformed into patch embedding. The embedding is passed through $L-1$ encoder blocks to generate image encoding (latent state). The image encoding is concatenated with character embedding (i.e. token embedding) before undergoing causal self-attention mechanism in the single decoder block to generate the ultimate latent state. Finally, the linear layer projects the normalized latent state into logits over character set.</figcaption>
 </figure>
 
 
@@ -118,7 +118,7 @@ For DTrOCR which is a decoder-only architecture, the image embedding (patch embe
 
 ## Fine-tuning TrorYongOCR
 
-You can check out the notebook below to train your own Small OCR Model.
+You can check out the notebook below to fine-tune TrorYongOCRModel for your custom dataset.
 
 [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Kimang18/SourceCode-KrorngAI-YT/blob/main/FinetuneTrorYongOCR.ipynb)
 
