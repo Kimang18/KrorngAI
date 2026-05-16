@@ -6,7 +6,6 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 from torch import nn, Tensor
-from torch.cuda.amp import autocast
 
 
 def precompute_rotary_emb(seq_len, head_dim, device, base=10000):
@@ -15,8 +14,9 @@ def precompute_rotary_emb(seq_len, head_dim, device, base=10000):
     t = torch.arange(seq_len, dtype=torch.float32, device=device)
     freqs = torch.outer(t, inv_freq)
     cos, sin = freqs.cos(), freqs.sin()
-    cos, sin = cos.bfloat16(), sin.bfloat16()
-    cos, sin = cos[None, :, None, :], sin[None, :, None, :]
+    # cos, sin = cos.bfloat16(), sin.bfloat16()
+    # cos, sin = cos.half(), sin.half()  # stored in float16 for 16-mixed
+    cos, sin = cos[None, None, :, :], sin[None, None, :, :]
     return cos, sin
 
 
@@ -37,38 +37,30 @@ def apply_rotary_emb(x, cos, sin):
 
 class LinearWrapper(nn.Linear):
     def forward(self, x: Tensor) -> Tensor:
-        with autocast(enabled=True):
-            return super().forward(x)
-        # return F.linear(
-        #     x,
-        #     self.weight.to(x.dtype),
-        #     None if self.bias is None else self.bias.to(x.dtype)
-        # )
+        return F.linear(
+            x,
+            self.weight.to(x.dtype),
+            None if self.bias is None else self.bias.to(x.dtype)
+        )
 
 
 class LayerNormWrapper(nn.LayerNorm):
     def forward(self, x: Tensor) -> Tensor:
-        with autocast(enabled=True):
-            return super().forward(x)
-        # return super().forward(x.float()).type(x.dtype)
+        return super().forward(x.float()).type(x.dtype)
 
 
 class RMSNormWrapper(nn.RMSNorm):
     def forward(self, x: Tensor) -> Tensor:
-        with autocast(enabled=True):
-            return super().forward(x)
-        # return super().forward(x.float()).type(x.dtype)
+        return super().forward(x.float()).type(x.dtype)
 
 
 class Conv1dWrapper(nn.Conv1d):
     def _conv_forward(
         self, x: Tensor, weight: Tensor, bias: Optional[Tensor]
     ) -> Tensor:
-        with autocast(enabled=True):
-            return super()._conv_forward(x)
-        # return super()._conv_forward(
-        #     x, weight.to(x.dtype), None if bias is None else bias.to(x.dtype)
-        # )
+        return super()._conv_forward(
+            x, weight.to(x.dtype), None if bias is None else bias.to(x.dtype)
+        )
 
 
 class Dynamic_erf(nn.Module):
@@ -98,9 +90,7 @@ class Dynamic_erf(nn.Module):
 
 class DerfWrapper(Dynamic_erf):
     def forward(self, x: Tensor) -> Tensor:
-        with autocast(enabled=True):
-            return super().forward(x)
-        # return super().forward(x.float()).type(x.dtype)
+        return super().forward(x.float()).type(x.dtype)
 
 
 class Conv1D(nn.Module):
@@ -221,8 +211,8 @@ class MLP(nn.Module):
 
     def forward(self, x):
         x_up = self.up_proj(x)
-        x = F.silu(self.gate_proj(x))
-        # x = F.relu(x).square() * x_up
+        x = F.silu(self.gate_proj(x))  # silu is the swish function
+        # x = F.relu(x).square()
         # x = F.gelu(x, approximate="tanh") * x_up
         x = x * x_up
         return self.dropout(self.down_proj(x))
