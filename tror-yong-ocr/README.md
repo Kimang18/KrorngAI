@@ -49,7 +49,7 @@ print(tokenizer.decode(tokenizer.encode(data[0]['text'], add_special_tokens=True
 # this should print <s>Amazon បង្កើនការវិនិយោគជិត១</s>
 ```
 
-When preparing a dataset to train `TrorYongOCR`, you just need to transform the text into token ids using the tokenizer
+When preparing a dataset to train `TrorYongOCRModel`, you just need to transform the text into token ids using the tokenizer
 ```python
 sentence = 'Cambodia needs peace.'
 token_ids = tokenizer.encode(sentence, add_special_tokens=True)
@@ -57,23 +57,55 @@ token_ids = tokenizer.encode(sentence, add_special_tokens=True)
 
 __NOTE:__ I want to highlight that my tokenizer works at character level.
 
-## Loading TrorYongOCR model
+## Loading TrorYongOCRModel
 
-Inspired by [`PARSeq`](https://github.com/baudm/parseq/tree/main) and [`DTrOCR`](https://github.com/arvindrajan92/DTrOCR), I design `TrorYongOCR` as the following: given `n_layer` transformer layers
-- `n_layer-1` are encoding layers for encoding a given image
-- the final layer is a decoding layer without cross-attention mechanism
-- for the decoding layer,
-  - the __latent state__ of an image (the output of encoding layers) is concatenated with the __input character embedding__ (token embedding including `bos` token plus position embedding) to create __context vector__, _i.e._ __key and value vectors__ (think of it like a prompt prefill)
-  - and the __input character embedding__ (token embedding plus position embedding) is used as __query vector__.
+Get started with the code below
+
+```python
+import torch
+from torchvision.transforms import v2 as transforms
+from PIL import Image # pip install pillow
+from tror_yong_ocr import get_tokenizer, TrorYongOCRModel
+
+img = Image.open("your/file/image").convert('RGB')
+
+processor = transforms.Compose(
+    [
+        transforms.Resize((32, 128)),
+        transforms.ToImage(),
+        transforms.ToDtype(torch.float32, scale=True),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ]
+)
+
+img_tensor = processor(img)
+
+tokenizer = get_tokenizer()
+model = TrorYongOCRModel.from_pretrained('KrorngAI/TrorYongOCR')
+model.eval()
+
+# suppose that you have an image array in numpy
+pred_ids = model.decode(img_tensor, 192, temperature=0.01, top_k=25)
+print(tokenizer.decode(pred_ids[0].tolist(), ignore_special_tokens=True))
+```
+
+TrorYongOCR is designed as the following: given $L$ transformer blocks
+
+- $L-1$ are encoding blocks that encode a given image
+- the last block is a single decoding block without cross-attention mechanism
+- each transformer is implemented with exclusive self-attention [@zhai2026exclusive] style and SwiGLU in MLP
+
+For the single decoding block,
+
+- the latent state of an image (the output of encoding blocks) is concatenated with the input character embedding (token embedding including bos token) to create context vector, _i.e._ key and value vectors (think of it like a prefill prompt)
 
 The architecture of TrorYongOCR can be found in Figure 1 below.
 
 <figure>
-  <div style="text-align: center;"><a name='slotMachine' ><img src="https://raw.githubusercontent.com/Kimang18/KrorngAI/refs/heads/main/tror-yong-ocr/TrorYongOCR.drawio.png" width="500" /></a></div>
+  <div style="text-align: center;"><a name='architecture' ><img src="https://huggingface.co/KrorngAI/TrorYongOCR/resolve/main/figures/architecture.png" width="500" /></a></div>
   <figcaption> Figure 1: TrorYongOCR architecture overview. The input image is transformed into patch embedding. Image embedding is obtained by additioning patch embedding and position embedding. The image embedding is passed through L-1 encoder blocks to generate image encoding (latent state). The image encoding is concatenated with character embedding (i.e. token embedding plus position embedding) before undergoing causal self-attention mechanism in the single decoder block to generate next token.</figcaption>
 </figure>
 
-New technologies in Attention mechanism such as Rotary Positional Embedding (RoPE), and Sigmoid Linear Unit (SiLU) and Gated Linear Unit (GLU) in MLP of Transformer block are implemented in TrorYongOCR.
 
 ### Compared to PARSeq
 
@@ -83,28 +115,8 @@ For `PARSeq` model which is an encoder-decoder architecture, text decoder uses p
 
 For DTrOCR which is a decoder-only architecture, the image embedding (patch embedding plus position embedding) is concatenated with input character embedding (a `[SEP]` token is added at the beginning of input character embedding to indicate sequence separation. `[SEP]` token is equivalent to `bos` token in `TrorYongOCR`), and causal self-attention mechanism is applied to the concatenation from layer to layer to generate text autoregressively (see Figure 2 of their paper).
 
-```python
-from tror_yong_ocr import TrorYongOCR, TrorYongConfig
-from tror_yong_ocr import get_tokenizer
 
-tokenizer = get_tokenizer()
-
-config = TrorYongConfig(
-    img_size=(32, 128),
-    patch_size=(4, 8),
-    n_channel=3,
-    vocab_size=len(tokenizer),
-    block_size=192,
-    n_layer=4,
-    n_head=6,
-    n_embed=384,
-    dropout=0.1,
-    bias=True,
-)
-model = TrorYongOCR(config, tokenizer)
-```
-
-## Train TrorYongOCR
+## Fine-tuning TrorYongOCR
 
 You can check out the notebook below to train your own Small OCR Model.
 
@@ -112,39 +124,12 @@ You can check out the notebook below to train your own Small OCR Model.
 
 I also have a video about training TrorYongOCR below
 
-[![Watch the video](https://i9.ytimg.com/vi/3W8P0mByFBY/mqdefault.jpg?v=6995e008&sqp=CMSg4cwG&rs=AOn4CLBmVopfxv_RJGQPJE5qU9eQP4_XBw)](https://youtu.be/3W8P0mByFBY)
+<a href="http://www.youtube.com/watch?feature=player_embedded&v=3W8P0mByFBY" target="_blank">
+ <img src="http://img.youtube.com/vi/3W8P0mByFBY/mqdefault.jpg" alt="Watch the video" height="240" border="1" />
+</a>
 
-## Inference
-
-I also provide `decode` function to decode image in `TrorYongOCR` class.
-Note that it can process only one image at a time.
-```python
-from tror_yong_ocr import TrorYongOCR, TrorYongConfig
-from tror_yong_ocr import get_tokenizer
-
-
-tokenizer = get_tokenizer()
-
-config = TrorYongConfig(
-    img_size=(32, 128),
-    patch_size=(4, 8),
-    n_channel=3,
-    vocab_size=len(tokenizer), # exclude pad and unk tokens
-    block_size=192,
-    n_layer=4,
-    n_head=6,
-    n_embed=384,
-    dropout=0.1,
-    bias=True,
-)
-model = TrorYongOCR(config, tokenizer)
-model.load_state_dict(torch.load('path/to/your/weights.pt', map_location='cpu'))
-
-pred = model.decode(batch['img_tensor'][0], max_tokens=192, temperature=0.001, top_k=None)
-print(tokenizer.decode(pred[0].tolist(), ignore_special_tokens=True))
-```
 
 ## TODO:
-- [X] implement model with KV cache `TrorYongOCR`
-- [X] notebook colab for training `TrorYongOCR`
+- [X] implement model with KV cache `TrorYongOCRModel`
+- [X] notebook colab for fine-tuning `TrorYongOCRModel`
 - [ ] benchmarking
