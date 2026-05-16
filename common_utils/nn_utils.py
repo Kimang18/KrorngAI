@@ -211,8 +211,8 @@ class MLP(nn.Module):
 
     def forward(self, x):
         x_up = self.up_proj(x)
-        x = F.silu(self.gate_proj(x))
-        # x = F.relu(x).square() * x_up
+        x = F.silu(self.gate_proj(x))  # silu is the swish function
+        # x = F.relu(x).square()
         # x = F.gelu(x, approximate="tanh") * x_up
         x = x * x_up
         return self.dropout(self.down_proj(x))
