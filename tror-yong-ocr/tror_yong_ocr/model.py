@@ -93,8 +93,8 @@ class MultiheadAttention(nn.Module):
             if s > l:
                 q = apply_rotary_emb(q, cos[:, :, s-l:s], sin[:, :, s-l:s])
             else:
-                q = apply_rotary_emb(q, cos[:, :, :s], sin[:, :, :s])
-            k = apply_rotary_emb(k, cos[:, :, :s], sin[:, :, :s])
+                q = apply_rotary_emb(q, cos, sin)
+            k = apply_rotary_emb(k, cos, sin)
         if kv_cache is not None:
             k, v = kv_cache.insert_kv(0, k, v)
         qkv = F.scaled_dot_product_attention(q, k, v, dropout_p=self.dropout.p, attn_mask=attn_mask, is_causal=False)
@@ -151,7 +151,8 @@ class TrorYongOCRModel(
         self.n_patch = (config.img_size[0] // config.patch_size[0]) * (config.img_size[1] // config.patch_size[1])
         self.img_embed = PatchEmbedding(config.n_channel, config.patch_size, config.n_embed)
         self.head_dim = self.config.n_embed // self.config.n_head
-        self.rotary_seq_len = 10 * (self.n_patch + self.config.block_size)
+        full_ctx = self.n_patch + self.config.block_size
+        self.rotary_seq_len = 10 * full_ctx
         cos, sin = precompute_rotary_emb(self.rotary_seq_len, self.head_dim, device=self.img_embed.patch_embed.weight.device)
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
@@ -177,7 +178,7 @@ class TrorYongOCRModel(
         )
         self.lm_head = LinearWrapper(config.n_embed, config.vocab_size)
 
-        mask = torch.tril(torch.ones((self.n_patch+config.block_size, self.n_patch+config.block_size), dtype=torch.bool))
+        mask = torch.tril(torch.ones((full_ctx, full_ctx), dtype=torch.bool))
         self.register_buffer("mask", mask)
         self.apply(self.init_weights)
         if verbose:
@@ -192,13 +193,14 @@ class TrorYongOCRModel(
         S = self.n_patch + L
 
         img_emb = self.dropout(self.img_embed(img))
-        cos_sin = self.cos[:, :, :S], self.sin[:, :, :S]
+        cos_sin = self.cos[:, :, :self.n_patch], self.sin[:, :, :self.n_patch]
         for block in self.blocks:
             img_emb = block(img_emb, cos_sin=cos_sin) # regular encoding layer to encode image
 
         # decoding layer
         # all character tokens must communicate with all image encoding
-        mask = self.mask[self.n_patch:self.n_patch + L, :S]
+        mask = self.mask[self.n_patch:S, :S]
+        cos_sin = self.cos[:, :, :S], self.sin[:, :, :S]
 
         query = self.dropout(self.tok_embed(x))
         query = self.txt_decoder(query, img_enc=img_emb, src_mask=mask, cos_sin=cos_sin)
@@ -268,9 +270,3 @@ class TrorYongOCRModel(
             nn.init.kaiming_normal_(module.weight)
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
-        elif isinstance(module, (nn.LayerNorm, nn.BatchNorm2d, nn.GroupNorm)):
-            nn.init.ones_(module.weight)
-            nn.init.zeros_(module.bias)
-
-        # if self.tok_embed.weight.device.type == 'cuda':
-        #     self.tok_embed.weight = self.tok_embed.weight.to(torch.bfloat16)
