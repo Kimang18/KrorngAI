@@ -1,8 +1,35 @@
-# TrorYong OCR Model
+# TrorYongOCR Model
 
-`TrorYongOCR`, is an Optical Character Recognition Model implemented by KrorngAI.
+`TrorYongOCR`, is an Optical Character Recognition Model designed by Dr. Kimang KHUN.
 
 `TrorYong` (ត្រយ៉ង) is Khmer word for giant ibis, the bird that symbolises __Cambodia__.
+
+__TrorYongOCR__ is designed as the following: given $L$ transformer blocks
+
+- $L-1$ are encoding blocks that encode a given image
+- the last block is a single decoding block without cross-attention mechanism
+- each transformer is implemented with exclusive self-attention style and SwiGLU in MLP
+
+For the single decoding block,
+
+- the latent state of an image (the output of encoding blocks) is concatenated with the input character embedding (token embedding including bos token) to create context vector, _i.e._ key and value vectors (think of it like a prefill prompt)
+
+The architecture of __TrorYongOCR__ can be found in Figure 1 below.
+
+<figure>
+  <div style="text-align: center;"><a name='architecture' ><img src="https://huggingface.co/KrorngAI/TrorYongOCR/resolve/main/figures/architecture.png" width="500" /></a></div>
+  <figcaption> Figure 1: TrorYongOCR architecture overview. The input image is transformed into patch embedding. The embedding is passed through L-1 encoder blocks to generate image encoding (latent state). The image encoding is concatenated with character embedding (i.e. token embedding) before undergoing causal self-attention mechanism in the single decoder block to generate the ultimate latent state. Finally, the linear layer projects the normalized latent state into logits over character set.</figcaption>
+</figure>
+
+
+### Compared to PARSeq
+
+For `PARSeq` model which is an encoder-decoder architecture, text decoder uses position embedding as __query vector__, character embedding (token embedding plus position embedding) as __context vector__, and the __latent state__ from image encoder as __memory__ for the cross-attention mechanism (see Figure 3 of their paper).
+
+### Compared to DTrOCR
+
+For DTrOCR which is a decoder-only architecture, the image embedding (patch embedding plus position embedding) is concatenated with input character embedding (a `[SEP]` token is added at the beginning of input character embedding to indicate sequence separation. `[SEP]` token is equivalent to `bos` token in `TrorYongOCR`), and causal self-attention mechanism is applied to the concatenation from layer to layer to generate text autoregressively (see Figure 2 of their paper).
+
 
 ## Support My Work
 
@@ -55,7 +82,7 @@ sentence = 'Cambodia needs peace.'
 token_ids = tokenizer.encode(sentence, add_special_tokens=True)
 ```
 
-__NOTE:__ I want to highlight that my tokenizer works at character level.
+__NOTE:__ My tokenizer works at character level.
 
 ## Loading TrorYongOCRModel
 
@@ -84,45 +111,18 @@ tokenizer = get_tokenizer()
 model = TrorYongOCRModel.from_pretrained('KrorngAI/TrorYongOCR')
 model.eval()
 
-# suppose that you have an image array in numpy
 pred_ids = model.decode(img_tensor, 192, temperature=0.01, top_k=25)
 print(tokenizer.decode(pred_ids[0].tolist(), ignore_special_tokens=True))
 ```
 
-TrorYongOCR is designed as the following: given $L$ transformer blocks
-
-- $L-1$ are encoding blocks that encode a given image
-- the last block is a single decoding block without cross-attention mechanism
-- each transformer is implemented with exclusive self-attention [@zhai2026exclusive] style and SwiGLU in MLP
-
-For the single decoding block,
-
-- the latent state of an image (the output of encoding blocks) is concatenated with the input character embedding (token embedding including bos token) to create context vector, _i.e._ key and value vectors (think of it like a prefill prompt)
-
-The architecture of TrorYongOCR can be found in Figure 1 below.
-
-<figure>
-  <div style="text-align: center;"><a name='architecture' ><img src="https://huggingface.co/KrorngAI/TrorYongOCR/resolve/main/figures/architecture.png" width="500" /></a></div>
-  <figcaption> Figure 1: TrorYongOCR architecture overview. The input image is transformed into patch embedding. The embedding is passed through $L-1$ encoder blocks to generate image encoding (latent state). The image encoding is concatenated with character embedding (i.e. token embedding) before undergoing causal self-attention mechanism in the single decoder block to generate the ultimate latent state. Finally, the linear layer projects the normalized latent state into logits over character set.</figcaption>
-</figure>
-
-
-### Compared to PARSeq
-
-For `PARSeq` model which is an encoder-decoder architecture, text decoder uses position embedding as __query vector__, character embedding (token embedding plus position embedding) as __context vector__, and the __latent state__ from image encoder as __memory__ for the cross-attention mechanism (see Figure 3 of their paper).
-
-### Compared to DTrOCR
-
-For DTrOCR which is a decoder-only architecture, the image embedding (patch embedding plus position embedding) is concatenated with input character embedding (a `[SEP]` token is added at the beginning of input character embedding to indicate sequence separation. `[SEP]` token is equivalent to `bos` token in `TrorYongOCR`), and causal self-attention mechanism is applied to the concatenation from layer to layer to generate text autoregressively (see Figure 2 of their paper).
-
 
 ## Fine-tuning TrorYongOCR
 
-You can check out the notebook below to fine-tune TrorYongOCRModel for your custom dataset.
+You can check the notebook below to fine-tune `TrorYongOCRModel` for your custom dataset.
 
 [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Kimang18/SourceCode-KrorngAI-YT/blob/main/FinetuneTrorYongOCR.ipynb)
 
-I also have a video about training TrorYongOCR below
+I also have a video about training `TrorYongOCR` explained in Khmer language below
 
 <a href="http://www.youtube.com/watch?feature=player_embedded&v=3W8P0mByFBY" target="_blank">
  <img src="http://img.youtube.com/vi/3W8P0mByFBY/mqdefault.jpg" alt="Watch the video" height="240" border="1" />
