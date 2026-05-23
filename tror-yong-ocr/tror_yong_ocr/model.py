@@ -153,7 +153,7 @@ class TrorYongOCRModel(
         self.head_dim = self.config.n_embed // self.config.n_head
         full_ctx = self.n_patch + self.config.block_size
         self.rotary_seq_len = 10 * full_ctx
-        cos, sin = precompute_rotary_emb(self.rotary_seq_len, self.head_dim, device=self.img_embed.patch_embed.weight.device)
+        cos, sin = precompute_rotary_emb(self.rotary_seq_len, self.head_dim, device=self.device)
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
 
@@ -212,23 +212,31 @@ class TrorYongOCRModel(
             # inference mode
             return self.lm_head(norm(query[:, [-1], :])).float(), None
 
+    @property
+    def device(self):
+        return self.img_embed.patch_embed.weight.device
+
     @torch.inference_mode()
-    def decode(self, img_tensor: Tensor, max_tokens: int, temperature=1.0, top_k=None):
+    def decode(self, img_tensor: Tensor, max_tokens: int, temperature=1.0, top_k=None, seed=168):
         """
         img_tensor: (3, 32, 128)
         max_tokens: int
         """
+        seq_len = self.mask.shape[0]
+        assert max_tokens <= seq_len, "too long sequence generation, consider lower max_tokens"
+        kv_cache = KVCache(1, self.config.n_head, seq_len, self.head_dim, 1)
+        rng = None
+        if temperature > 0:
+            rng = torch.Generator(device=self.device)
+            rng.manual_seed(seed)
+
         img_tensor = img_tensor.unsqueeze(0)
         img_emb = self.dropout(self.img_embed(img_tensor))
         cos_sin = self.cos[:, :, :self.n_patch], self.sin[:, :, :self.n_patch]
         for block in self.blocks:
             img_emb = block(img_emb, cos_sin=cos_sin)
 
-        seq_len = self.mask.shape[0]
-        assert max_tokens <= seq_len, "too long sequence generation, consider lower max_tokens"
-        kv_cache = KVCache(1, self.config.n_head, seq_len, self.head_dim, 1)
-
-        idx = torch.full((1,1), fill_value=self.config.bos_id, dtype=torch.long, device=img_tensor.device)
+        idx = torch.full((1,1), fill_value=self.config.bos_id, dtype=torch.long, device=self.device)
         idx_next = None
         for i in range(1, max_tokens):
             mask = self.mask[self.n_patch + i-1:self.n_patch + i, :self.n_patch + i]
@@ -242,12 +250,15 @@ class TrorYongOCRModel(
                 query = self.txt_decoder(query, src_mask=mask, cos_sin=cos_sin, kv_cache=kv_cache)
             logits = self.lm_head(norm(query[:, [-1], :])).float()
 
-            logits = logits[:, -1, :] / temperature
-            if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float('inf')
-            probs = F.softmax(logits, dim=-1)
-            idx_next = torch.multinomial(probs, num_samples=1)
+            if temperature > 0:
+                logits = logits[:, -1, :] / temperature
+                if top_k is not None:
+                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                    logits[logits < v[:, [-1]]] = -float('inf')
+                probs = F.softmax(logits, dim=-1)
+                idx_next = torch.multinomial(probs, num_samples=1, generator=rng)
+            else:
+                idx_next = logits.argmax(dim=-1)
             idx = torch.cat((idx, idx_next), dim=1)
             if idx_next.item() == self.config.eos_id:
                 break
