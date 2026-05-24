@@ -18,6 +18,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 from huggingface_hub import PyTorchModelHubMixin
+from transformers.modeling_outputs import CausalLMOutput
 from .nn_utils import (
     precompute_rotary_emb,
     DerfWrapper,
@@ -47,7 +48,7 @@ class TrorYongOCRConfig:
     bias: bool = True
 
 
-class Conv2d(nn.Conv2d):
+class Conv2dWrapper(nn.Conv2d):
     def _conv_forward(
         self, x: Tensor, weight: Tensor, bias: Optional[Tensor]
     ) -> Tensor:
@@ -59,7 +60,7 @@ class Conv2d(nn.Conv2d):
 class PatchEmbedding(nn.Module):
     def __init__(self, n_channels, patch_size, n_embed):
         super().__init__()
-        self.patch_embed = Conv2d(n_channels, n_embed, kernel_size=patch_size, stride=patch_size, bias=False)
+        self.patch_embed = Conv2dWrapper(n_channels, n_embed, kernel_size=patch_size, stride=patch_size, bias=True)
 
     def forward(self, x):
         x = self.patch_embed(x)
@@ -74,7 +75,7 @@ class MultiheadAttention(nn.Module):
         self.n_head = n_head
         self.dropout = nn.Dropout(dropout)
         self.q_proj = LinearWrapper(n_embed, n_embed, bias=bias)
-        self.k_proj = LinearWrapper(n_embed, n_embed, bias=bias)
+        self.k_proj = LinearWrapper(n_embed, n_embed, bias=False)
         self.v_proj = LinearWrapper(n_embed, n_embed, bias=bias)
         self.out_proj = LinearWrapper(n_embed, n_embed, bias=bias)
 
@@ -153,18 +154,19 @@ class TrorYongOCRModel(
         self.head_dim = self.config.n_embed // self.config.n_head
         full_ctx = self.n_patch + self.config.block_size
         self.rotary_seq_len = 10 * full_ctx
-        cos, sin = precompute_rotary_emb(self.rotary_seq_len, self.head_dim, device=self.device)
+        cos, sin = precompute_rotary_emb(self.rotary_seq_len, self.head_dim, device=self.device, rope_percentage=0.75)
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
 
         self.tok_embed = nn.Embedding(config.vocab_size, config.n_embed, padding_idx=config.pad_id)
         self.dropout = nn.Dropout(config.dropout)
+        mlp_dim = int(4 * config.n_embed // 3)
         self.blocks = nn.ModuleList(
             [
                 ResidualAttentionBlock(
                     d_model=config.n_embed,
                     nhead=config.n_head,
-                    dim_feedforward=2*config.n_embed,
+                    dim_feedforward=mlp_dim,
                     dropout=config.dropout,
                     bias=config.bias)
             for _ in range(config.n_layer-1)]
@@ -172,14 +174,14 @@ class TrorYongOCRModel(
         self.txt_decoder = ResidualAttentionBlock(
             d_model=config.n_embed,
             nhead=config.n_head,
-            dim_feedforward=4*config.n_embed,
+            dim_feedforward=2*mlp_dim,
             dropout=config.dropout,
             bias=config.bias
         )
-        self.lm_head = LinearWrapper(config.n_embed, config.vocab_size)
+        self.lm_head = LinearWrapper(config.n_embed, config.vocab_size, bias=config.bias)
 
-        mask = torch.tril(torch.ones((full_ctx, full_ctx), dtype=torch.bool))
-        self.register_buffer("mask", mask)
+        mask = torch.empty(full_ctx, full_ctx).fill_(-float('inf')).triu_(1)
+        self.register_buffer("mask", mask, persistent=False)
         self.apply(self.init_weights)
         if verbose:
             print_banner()
@@ -207,10 +209,11 @@ class TrorYongOCRModel(
         if targets is not None:
             logits = self.lm_head(norm(query)) # (b, L, n_vocab)
             loss = F.cross_entropy(logits.flatten(end_dim=1).float(), targets.flatten(), ignore_index=self.config.pad_id)
-            return logits, loss
+            return CausalLMOutput(logits=logits, loss=loss)
         else:
             # inference mode
-            return self.lm_head(norm(query[:, [-1], :])).float(), None
+            logits = self.lm_head(norm(query[:, [-1], :])).float()
+            return CausalLMOutput(logits=logits)
 
     @property
     def device(self):
