@@ -214,7 +214,7 @@ class TrorYongASRModel(
         self.n_head = 2 * config.n_head
         self.head_dim = config.n_embed // self.n_head
         self.rotary_seq_len = 10 * config.n_text_ctx
-        cos, sin = precompute_rotary_emb(self.rotary_seq_len, self.head_dim, device=self.device)
+        cos, sin = precompute_rotary_emb(self.rotary_seq_len, self.head_dim, device=self.device, rope_percentage=0.75)
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
 
@@ -223,9 +223,9 @@ class TrorYongASRModel(
         self.pad_vocab_size = (config.vocab_size + 63) // 64 * 64
         self.tok_embed = nn.Embedding(self.pad_vocab_size, config.n_embed, padding_idx=self.config.pad_id)
         self.pos_basis = nn.Parameter(Tensor(config.n_embed))
-        # self.pos_basis = nn.Parameter(Tensor(self.n_head, self.head_dim))
         self.dropout = nn.Dropout(config.dropout)
-        self.decoder = DecoderBlock(config.n_embed, self.n_head, config.n_embed * 4, config.dropout, config.bias)
+        mlp_dim = int(8 * config.n_embed // 3)
+        self.decoder = DecoderBlock(config.n_embed, self.n_head, mlp_dim, config.dropout, config.bias)
         self.lm_head = LinearWrapper(config.n_embed, self.pad_vocab_size, bias=False)
 
         # weight tying
@@ -415,14 +415,13 @@ class TrorYongASRModel(
             self.lm_head.weight = self.tok_embed.weight
 
         nn.init.trunc_normal_(self.pos_basis, std=1.0)
-        # nn.init.orthogonal_(self.pos_basis)
 
         # Rotary embeddings
-        cos, sin = precompute_rotary_emb(self.rotary_seq_len, self.head_dim, device=self.device)
+        cos, sin = precompute_rotary_emb(self.rotary_seq_len, self.head_dim, device=self.device, rope_percentage=0.75)
         self.cos, self.sin = cos, sin
 
         self.mask = torch.empty(self.config.n_text_ctx, self.config.n_text_ctx).fill_(-float('inf')).triu_(1)
 
-        # if self.tok_embed.weight.device.type == 'cuda':
-        #     self.tok_embed.weight = self.tok_embed.weight.to(torch.bfloat16)
-        #     self.pos_basis = self.pos_basis.to(torch.bfloat16)
+        if self.tok_embed.weight.device.type == 'cuda':
+            self.tok_embed.weight = self.tok_embed.weight.to(torch.bfloat16)
+            self.pos_basis = self.pos_basis.to(torch.bfloat16)
