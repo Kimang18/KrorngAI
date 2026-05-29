@@ -186,29 +186,36 @@ class TrorYongOCRModel(
         if verbose:
             print_banner()
 
-    def forward(self, img, x, targets=None):
+    def forward(self, img, input_ids, target_ids=None, kv_cache=None):
         """
-        x including bos
+        input_ids including bos
         img image tensor (b, 3, 32, 128)
         """
-        b, L = x.size()
-        S = self.n_patch + L
+        query = self.dropout(self.tok_embed(input_ids))
+        if kv_cache is None or kv_cache.kv_cache is None:
+            b, L = input_ids.size()
+            S = self.n_patch + L
+            img_emb = self.dropout(self.img_embed(img))
+            cos_sin = self.cos[:, :, :self.n_patch], self.sin[:, :, :self.n_patch]
+            for block in self.blocks:
+                img_emb = block(img_emb, cos_sin=cos_sin) # regular encoding layer to encode image
 
-        img_emb = self.dropout(self.img_embed(img))
-        cos_sin = self.cos[:, :, :self.n_patch], self.sin[:, :, :self.n_patch]
-        for block in self.blocks:
-            img_emb = block(img_emb, cos_sin=cos_sin) # regular encoding layer to encode image
+            # decoding layer
+            # all character tokens must communicate with all image encoding
+            mask = self.mask[self.n_patch:S, :S]
+            cos_sin = self.cos[:, :, :S], self.sin[:, :, :S]
 
-        # decoding layer
-        # all character tokens must communicate with all image encoding
-        mask = self.mask[self.n_patch:S, :S]
-        cos_sin = self.cos[:, :, :S], self.sin[:, :, :S]
+            query = self.txt_decoder(query, img_enc=img_emb, src_mask=mask, cos_sin=cos_sin, kv_cache=kv_cache)
+        else:
+            S0 = kv_cache.get_pos()
+            mask = self.mask[[S0], :S0+1]
+            cos_sin = self.cos[:, :, [S0]], self.sin[:, :, [S0]]
 
-        query = self.dropout(self.tok_embed(x))
-        query = self.txt_decoder(query, img_enc=img_emb, src_mask=mask, cos_sin=cos_sin)
-        if targets is not None:
+            query = self.txt_decoder(query, src_mask=mask, cos_sin=cos_sin, kv_cache=kv_cache)
+
+        if target_ids is not None:
             logits = self.lm_head(norm(query)) # (b, L, n_vocab)
-            loss = F.cross_entropy(logits.flatten(end_dim=1).float(), targets.flatten(), ignore_index=self.config.pad_id)
+            loss = F.cross_entropy(logits.flatten(end_dim=1).float(), target_ids.flatten(), ignore_index=self.config.pad_id)
             return CausalLMOutput(logits=logits, loss=loss)
         else:
             # inference mode
@@ -233,25 +240,15 @@ class TrorYongOCRModel(
             rng = torch.Generator(device=self.device)
             rng.manual_seed(seed)
 
-        img_tensor = img_tensor.unsqueeze(0)
-        img_emb = self.dropout(self.img_embed(img_tensor))
-        cos_sin = self.cos[:, :, :self.n_patch], self.sin[:, :, :self.n_patch]
-        for block in self.blocks:
-            img_emb = block(img_emb, cos_sin=cos_sin)
-
+        img_tensor = img_tensor.unsqueeze(0) # create batch dimension
         idx = torch.full((1,1), fill_value=self.config.bos_id, dtype=torch.long, device=self.device)
-        idx_next = None
+        next_idx = None
         for i in range(1, max_tokens):
-            mask = self.mask[self.n_patch + i-1:self.n_patch + i, :self.n_patch + i]
-            if i == 1:
-                cos_sin = self.cos[:, :, :self.n_patch+i], self.sin[:, :, :self.n_patch+i]
-                query = self.dropout(self.tok_embed(idx))
-                query = self.txt_decoder(query, img_enc=img_emb, src_mask=mask, cos_sin=cos_sin, kv_cache=kv_cache)
+            if kv_cache.kv_cache is None:
+                curr_idx = idx
             else:
-                cos_sin = self.cos[:, :, [self.n_patch+i-1]], self.sin[:, :, [self.n_patch+i-1]]
-                query = self.dropout(self.tok_embed(idx_next))
-                query = self.txt_decoder(query, src_mask=mask, cos_sin=cos_sin, kv_cache=kv_cache)
-            logits = self.lm_head(norm(query[:, [-1], :])).float()
+                curr_idx = next_idx
+            logits = self.forward(img_tensor, curr_idx, kv_cache=kv_cache).logits
 
             if temperature > 0:
                 logits = logits[:, -1, :] / temperature
@@ -259,11 +256,11 @@ class TrorYongOCRModel(
                     v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                     logits[logits < v[:, [-1]]] = -float('inf')
                 probs = F.softmax(logits, dim=-1)
-                idx_next = torch.multinomial(probs, num_samples=1, generator=rng)
+                next_idx = torch.multinomial(probs, num_samples=1, generator=rng)
             else:
-                idx_next = logits.argmax(dim=-1)
-            idx = torch.cat((idx, idx_next), dim=1)
-            if idx_next.item() == self.config.eos_id:
+                next_idx = logits.argmax(dim=-1)
+            idx = torch.cat((idx, next_idx), dim=1)
+            if next_idx.item() == self.config.eos_id:
                 break
         return idx
 
