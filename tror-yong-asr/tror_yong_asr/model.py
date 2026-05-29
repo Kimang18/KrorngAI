@@ -342,7 +342,7 @@ class TrorYongASRModel(
         n = idx.shape[1]
         idx_next = None
         pos_query = self.pos_basis.view(1, 1, -1)
-        for i in range(n, n+max_tokens):
+        for i in range(n, max_tokens):
             if i == n:
                 q = pos_query.expand(-1, i, -1)
                 ctx = self.get_token_embedding(idx)
