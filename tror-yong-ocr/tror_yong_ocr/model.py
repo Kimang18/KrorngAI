@@ -44,6 +44,7 @@ class TrorYongOCRConfig:
     n_layer: int
     n_head: int
     n_embed: int
+    p_rope: float = 1.0
     dropout: float = 0.0
     bias: bool = True
 
@@ -79,7 +80,7 @@ class MultiheadAttention(nn.Module):
         self.v_proj = LinearWrapper(n_embed, n_embed, bias=bias)
         self.out_proj = LinearWrapper(n_embed, n_embed, bias=bias)
 
-    def forward(self, query, key, value, attn_mask, cos_sin=None, kv_cache=None):
+    def forward(self, query, key, value, cos_sin, attn_mask=None, key_padding_mask=None, kv_cache=None):
         b, l, _ = query.size()
         b, s, _ = key.size()
         q = self.q_proj(query)
@@ -91,13 +92,39 @@ class MultiheadAttention(nn.Module):
         q, k = norm(q), norm(k)
         if cos_sin is not None:
             cos, sin = cos_sin
-            if s > l:
+            if key_padding_mask is not None:
+                # NOTE: shift rotation due to padding patches
+                mask_prime = (key_padding_mask == 0.0)
+                # if s > l, then l=L and L0 = S - L, otherwise s=l=L0
+                L0 = s-l if s > l else l
+                mask_prime[:, L0:] = True  # do not shift rotation on padding in chr seq
+                mask_prime = mask_prime.unsqueeze(-1).expand(-1, -1, cos.shape[-1])  # [b, s, head_dim]
+
+                # initialize all positions with null rotation
+                cos_prime = torch.full_like(mask_prime, fill_value=1.0, dtype=cos.dtype, device=cos.device)
+                sin_prime = torch.full_like(mask_prime, fill_value=0.0, dtype=sin.dtype, device=sin.device)
+
+                # mask_prime has False at the beginning (padding patches)
+                # So, torch.flip pushes False to the end
+                cos_prime[mask_prime] = cos.squeeze(1).expand(b, -1, -1)[torch.flip(mask_prime, dims=[1])]
+                sin_prime[mask_prime] = sin.squeeze(1).expand(b, -1, -1)[torch.flip(mask_prime, dims=[1])]
+                cos, sin = cos_prime.unsqueeze(1), sin_prime.unsqueeze(1)
+            # NOTE: `:s` in cos is required cuz for encoder blocks s=L0 and cos.shape[2]=L0+L
+            # The same for sin and key_padding_mask
+            if s > l:  # text_decoder block
                 q = apply_rotary_emb(q, cos[:, :, s-l:s], sin[:, :, s-l:s])
             else:
-                q = apply_rotary_emb(q, cos, sin)
-            k = apply_rotary_emb(k, cos, sin)
+                q = apply_rotary_emb(q, cos[:, :, :s], sin[:, :, :s])
+            k = apply_rotary_emb(k, cos[:, :, :s], sin[:, :, :s])
         if kv_cache is not None:
             k, v = kv_cache.insert_kv(0, k, v)
+
+        if key_padding_mask is not None:
+            # NOTE: key_padding_mask is used during pre-training
+            key_mask_expanded = key_padding_mask[:, :s].view(b, 1, 1, s).expand(-1, self.n_head, -1, -1)
+            query_mask = torch.zeros((1, 1, l, s), device=q.device) if attn_mask is None else attn_mask.view(1, 1, l, s)
+            attn_mask = query_mask.expand(b, self.n_head, -1, -1) + key_mask_expanded
+
         qkv = F.scaled_dot_product_attention(q, k, v, dropout_p=self.dropout.p, attn_mask=attn_mask, is_causal=False)
         if qkv.shape == v.shape:
             vn = F.normalize(v, dim=-1, eps=1e-9)
@@ -120,11 +147,12 @@ class ResidualAttentionBlock(nn.Module):
         self.mlp = MLP(d_model, dim_feedforward, dropout, bias)
         self.mlp_norm = DerfWrapper(d_model)
 
-    def forward(self, x, img_enc=None, src_mask=None, cos_sin=None, kv_cache=None):
+    def forward(self, x, img_enc=None, cos_sin=None, attn_mask=None, key_padding_mask=None, kv_cache=None):
         """
-        x: query/hidden state (b, L, n_embed)
-        img_enc: image encoding (b, n_patch, n_embed)
-        src_mask: attention mask (L, n_patch + L)
+        x: query/hidden state (b, L0 or L, n_embed)
+        img_enc: image encoding (b, L0, n_embed)
+        attn_mask: attention mask (L, L0 + L)
+        key_padding_mask: mask of padding tokens (b, L0 + L)
         """
         x_norm = self.sa_norm(x)
         if img_enc is None:
@@ -132,7 +160,7 @@ class ResidualAttentionBlock(nn.Module):
         else:
             memory = torch.cat([self.sa_norm(img_enc), x_norm], dim=1)
 
-        x = x + self.sa(x_norm, memory, memory, src_mask, cos_sin, kv_cache)[0]
+        x = x + self.sa(x_norm, memory, memory, cos_sin, attn_mask, key_padding_mask, kv_cache)[0]
         x = x + self.mlp(self.mlp_norm(x))
         return x
 
@@ -149,14 +177,8 @@ class TrorYongOCRModel(
         super().__init__()
         self.config = config
 
-        self.n_patch = (config.img_size[0] // config.patch_size[0]) * (config.img_size[1] // config.patch_size[1])
-        self.img_embed = PatchEmbedding(config.n_channel, config.patch_size, config.n_embed)
-        self.head_dim = self.config.n_embed // self.config.n_head
-        full_ctx = self.n_patch + self.config.block_size
-        self.rotary_seq_len = 10 * full_ctx
-        cos, sin = precompute_rotary_emb(self.rotary_seq_len, self.head_dim, device=self.device, rope_percentage=0.75)
-        self.register_buffer("cos", cos, persistent=False)
-        self.register_buffer("sin", sin, persistent=False)
+        self.patch_dim = config.n_channel * config.patch_size[0] * config.patch_size[1]
+        self.patch_embed = LinearWrapper(self.patch_dim, config.n_embed, bias=config.bias)
 
         self.tok_embed = nn.Embedding(config.vocab_size, config.n_embed, padding_idx=config.pad_id)
         self.dropout = nn.Dropout(config.dropout)
@@ -180,41 +202,59 @@ class TrorYongOCRModel(
         )
         self.lm_head = LinearWrapper(config.n_embed, config.vocab_size, bias=config.bias)
 
+        self.head_dim = self.config.n_embed // self.config.n_head
+        full_ctx = 2 * self.config.block_size
+        self.rotary_seq_len = 10 * full_ctx
+        cos, sin = precompute_rotary_emb(self.rotary_seq_len, self.head_dim, device=self.device, rope_percentage=config.p_rope)
+        self.register_buffer("cos", cos, persistent=False)
+        self.register_buffer("sin", sin, persistent=False)
         mask = torch.empty(full_ctx, full_ctx).fill_(-float('inf')).triu_(1)
         self.register_buffer("mask", mask, persistent=False)
         self.apply(self.init_weights)
         if verbose:
             print_banner()
 
-    def forward(self, img, input_ids, target_ids=None, kv_cache=None):
+    def forward(self, patch_tensor, input_ids, target_ids=None, patch_masks=None, kv_cache=None):
         """
-        input_ids including bos
-        img image tensor (b, 3, 32, 128)
+        patch tensor (b, L0, patch_dim)
+        input_ids including bos (b, L)
+        target_ids including eos (b, L)
+        patch masks (b, L0)
         """
         query = self.dropout(self.tok_embed(input_ids))
         if kv_cache is None or kv_cache.kv_cache is None:
-            b, L = input_ids.size()
-            S = self.n_patch + L
-            img_emb = self.dropout(self.img_embed(img))
-            cos_sin = self.cos[:, :, :self.n_patch], self.sin[:, :, :self.n_patch]
+
+            if patch_masks is not None:
+                patch_tensor = patch_tensor * patch_masks.unsqueeze(-1)
+                pat_padding_mask = torch.zeros_like(patch_masks, dtype=torch.float32)
+                pat_padding_mask.masked_fill_(~patch_masks, -float('inf'))
+                chr_padding_mask = torch.zeros_like(input_ids, dtype=torch.float32)
+                chr_padding_mask.masked_fill_(input_ids == self.config.pad_id, -float('inf'))
+                key_padding_mask = torch.cat([pat_padding_mask, chr_padding_mask], dim=1)
+            else:
+                key_padding_mask = None
+
+            img_enc = self.dropout(self.patch_embed(patch_tensor))
+            L0, L = patch_tensor.shape[1], input_ids.shape[1]
+            S = L0 + L
+            cos_sin = self.cos[:, :, :S], self.sin[:, :, :S]
             for block in self.blocks:
-                img_emb = block(img_emb, cos_sin=cos_sin) # regular encoding layer to encode image
+                img_enc = block(img_enc, cos_sin=cos_sin, key_padding_mask=key_padding_mask)  # regular encoding layer to encode image
 
             # decoding layer
             # all character tokens must communicate with all image encoding
-            mask = self.mask[self.n_patch:S, :S]
-            cos_sin = self.cos[:, :, :S], self.sin[:, :, :S]
+            mask = self.mask[L0:S, :S]
 
-            query = self.txt_decoder(query, img_enc=img_emb, src_mask=mask, cos_sin=cos_sin, kv_cache=kv_cache)
+            query = self.txt_decoder(query, img_enc=img_enc, cos_sin=cos_sin, attn_mask=mask, key_padding_mask=key_padding_mask, kv_cache=kv_cache)
         else:
             S0 = kv_cache.get_pos()
             mask = self.mask[[S0], :S0+1]
             cos_sin = self.cos[:, :, [S0]], self.sin[:, :, [S0]]
 
-            query = self.txt_decoder(query, src_mask=mask, cos_sin=cos_sin, kv_cache=kv_cache)
+            query = self.txt_decoder(query, cos_sin=cos_sin, attn_mask=mask, kv_cache=kv_cache)
 
         if target_ids is not None:
-            logits = self.lm_head(norm(query)) # (b, L, n_vocab)
+            logits = self.lm_head(norm(query))  # (b, L, n_vocab)
             loss = F.cross_entropy(logits.flatten(end_dim=1).float(), target_ids.flatten(), ignore_index=self.config.pad_id)
             return CausalLMOutput(logits=logits, loss=loss)
         else:
@@ -224,12 +264,12 @@ class TrorYongOCRModel(
 
     @property
     def device(self):
-        return self.img_embed.patch_embed.weight.device
+        return self.tok_embed.weight.device
 
     @torch.inference_mode()
-    def decode(self, img_tensor: Tensor, max_tokens: int, temperature=1.0, top_k=None, seed=168):
+    def decode(self, patch: Tensor, max_tokens: int, temperature=1.0, top_k=None, seed=168):
         """
-        img_tensor: (3, 32, 128)
+        patch: (patch_dim)
         max_tokens: int
         """
         seq_len = self.mask.shape[0]
@@ -240,7 +280,7 @@ class TrorYongOCRModel(
             rng = torch.Generator(device=self.device)
             rng.manual_seed(seed)
 
-        img_tensor = img_tensor.unsqueeze(0) # create batch dimension
+        patch = patch.unsqueeze(0)  # create batch dimension
         idx = torch.full((1,1), fill_value=self.config.bos_id, dtype=torch.long, device=self.device)
         next_idx = None
         for i in range(1, max_tokens):
@@ -248,7 +288,7 @@ class TrorYongOCRModel(
                 curr_idx = idx
             else:
                 curr_idx = next_idx
-            logits = self.forward(img_tensor, curr_idx, kv_cache=kv_cache).logits
+            logits = self.forward(patch, curr_idx, kv_cache=kv_cache).logits
 
             if temperature > 0:
                 logits = logits[:, -1, :] / temperature
@@ -270,7 +310,12 @@ class TrorYongOCRModel(
         if any(map(name.startswith, exclude)):
             return
         if isinstance(module, nn.Linear):
-            nn.init.trunc_normal_(module.weight, std=0.02)
+            # do kaiming_uniform(weight), but with gain=1.0
+            if 'patch_embed' in name:
+                s = 3**0.5 * self.patch_dim **-0.5  # fan_in mode
+            else:
+                s = 3**0.5 * self.config.n_embed **-0.5  # fan_in mode
+            nn.init.uniform_(module.weight, -s, s)
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
@@ -278,6 +323,6 @@ class TrorYongOCRModel(
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
         elif isinstance(module, nn.Conv2d):
-            nn.init.kaiming_normal_(module.weight)
+            nn.init.kaiming_uniform_(module.weight)
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
