@@ -33,7 +33,6 @@ from .common import print_banner
 
 @dataclass
 class TrorYongOCRConfig:
-    img_size: Sequence[int]
     patch_size: Sequence[int]
     n_channel: int
     vocab_size: int
@@ -78,6 +77,7 @@ class MultiheadAttention(nn.Module):
         self.q_proj = LinearWrapper(n_embed, n_embed, bias=bias)
         self.k_proj = LinearWrapper(n_embed, n_embed, bias=False)
         self.v_proj = LinearWrapper(n_embed, n_embed, bias=bias)
+        # self.beta = LinearWrapper(n_embed, self.n_head, bias=bias)
         self.out_proj = LinearWrapper(n_embed, n_embed, bias=bias)
 
     def forward(self, query, key, value, cos_sin, attn_mask=None, key_padding_mask=None, kv_cache=None):
@@ -131,6 +131,8 @@ class MultiheadAttention(nn.Module):
         else:  # when decoding, qkv=(b, n_head, 1, head_dim) != v_proj=(b, n_head, lk, head_dim)
             vn = F.normalize(v[:, :, [-1], :], dim=-1, eps=1e-9)
         qkv = qkv - torch.sum(qkv * vn, dim=-1, keepdim=True) * vn
+        # beta = 2 * torch.sigmoid(self.beta(query))  # (b, l, n_head)
+        # qkv = qkv - beta.transpose(1, 2).unsqueeze(-1) * torch.sum(qkv * vn, dim=-1, keepdim=True) * vn  # Householder-like transition
 
         qkv = qkv.permute(0, 2, 1, 3).flatten(start_dim=2)
         return self.dropout(self.out_proj(qkv)), _
@@ -170,7 +172,10 @@ class TrorYongOCRModel(
     PyTorchModelHubMixin
 ):
     """
-    Receive image and output characters
+    Receive raw patches and output characters
+    NOTE: during the training,
+    - images are resized by Resize((32, )) before patchifying
+    - for any images, there are at most 1024 patches
     """
 
     def __init__(self, config: TrorYongOCRConfig, verbose: bool=True) -> None:
@@ -203,7 +208,7 @@ class TrorYongOCRModel(
         self.lm_head = LinearWrapper(config.n_embed, config.vocab_size, bias=config.bias)
 
         self.head_dim = self.config.n_embed // self.config.n_head
-        full_ctx = 2 * self.config.block_size
+        full_ctx = 2 * self.config.block_size  # I chose n_patch_ctx=block_size=1024
         self.rotary_seq_len = 10 * full_ctx
         cos, sin = precompute_rotary_emb(self.rotary_seq_len, self.head_dim, device=self.device, rope_percentage=config.p_rope)
         self.register_buffer("cos", cos, persistent=False)
@@ -272,7 +277,7 @@ class TrorYongOCRModel(
         patch: (patch_dim)
         max_tokens: int
         """
-        seq_len = self.mask.shape[0]
+        seq_len = self.mask.shape[0] // 2
         assert max_tokens <= seq_len, "too long sequence generation, consider lower max_tokens"
         kv_cache = KVCache(1, self.config.n_head, seq_len, self.head_dim, 1)
         rng = None
@@ -322,7 +327,3 @@ class TrorYongOCRModel(
             nn.init.trunc_normal_(module.weight, std=0.02)
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
-        elif isinstance(module, nn.Conv2d):
-            nn.init.kaiming_uniform_(module.weight)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
