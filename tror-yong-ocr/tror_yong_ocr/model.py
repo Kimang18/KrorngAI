@@ -48,26 +48,6 @@ class TrorYongOCRConfig:
     bias: bool = True
 
 
-class Conv2dWrapper(nn.Conv2d):
-    def _conv_forward(
-        self, x: Tensor, weight: Tensor, bias: Optional[Tensor]
-    ) -> Tensor:
-        return super()._conv_forward(
-            x, weight.to(x.dtype), None if bias is None else bias.to(x.dtype)
-        )
-
-
-class PatchEmbedding(nn.Module):
-    def __init__(self, n_channels, patch_size, n_embed):
-        super().__init__()
-        self.patch_embed = Conv2dWrapper(n_channels, n_embed, kernel_size=patch_size, stride=patch_size, bias=True)
-
-    def forward(self, x):
-        x = self.patch_embed(x)
-        x = x.flatten(2).transpose(1, 2)
-        return x
-
-
 class MultiheadAttention(nn.Module):
     def __init__(self, n_embed, n_head, dropout=0.0, bias=True):
         super().__init__()
@@ -75,40 +55,20 @@ class MultiheadAttention(nn.Module):
         self.n_head = n_head
         self.dropout = nn.Dropout(dropout)
         self.q_proj = LinearWrapper(n_embed, n_embed, bias=bias)
-        self.k_proj = LinearWrapper(n_embed, n_embed, bias=False)
-        self.v_proj = LinearWrapper(n_embed, n_embed, bias=bias)
-        # self.beta = LinearWrapper(n_embed, self.n_head, bias=bias)
+        self.kv_proj = LinearWrapper(n_embed, 2 * n_embed, bias=bias)
         self.out_proj = LinearWrapper(n_embed, n_embed, bias=bias)
 
-    def forward(self, query, key, value, cos_sin, attn_mask=None, key_padding_mask=None, kv_cache=None):
+    def forward(self, query, content, cos_sin, attn_mask=None, key_padding_mask=None, kv_cache=None):
         b, l, _ = query.size()
-        b, s, _ = key.size()
+        b, s, _ = content.size()
         q = self.q_proj(query)
-        k = self.k_proj(key)
-        v = self.v_proj(value)
+        k, v = self.kv_proj(content).split(self.n_embed, dim=2)
         q = q.view(b, l, self.n_head, -1).permute(0, 2, 1, 3)
         k = k.view(b, s, self.n_head, -1).permute(0, 2, 1, 3)
         v = v.view(b, s, self.n_head, -1).permute(0, 2, 1, 3)
         q, k = norm(q), norm(k)
         if cos_sin is not None:
             cos, sin = cos_sin
-            if key_padding_mask is not None:
-                # NOTE: shift rotation due to padding patches
-                mask_prime = (key_padding_mask == 0.0)
-                # if s > l, then l=L and L0 = S - L, otherwise s=l=L0
-                L0 = s-l if s > l else l
-                mask_prime[:, L0:] = True  # do not shift rotation on padding in chr seq
-                mask_prime = mask_prime.unsqueeze(-1).expand(-1, -1, cos.shape[-1])  # [b, s, head_dim]
-
-                # initialize all positions with null rotation
-                cos_prime = torch.full_like(mask_prime, fill_value=1.0, dtype=cos.dtype, device=cos.device)
-                sin_prime = torch.full_like(mask_prime, fill_value=0.0, dtype=sin.dtype, device=sin.device)
-
-                # mask_prime has False at the beginning (padding patches)
-                # So, torch.flip pushes False to the end
-                cos_prime[mask_prime] = cos.squeeze(1).expand(b, -1, -1)[torch.flip(mask_prime, dims=[1])]
-                sin_prime[mask_prime] = sin.squeeze(1).expand(b, -1, -1)[torch.flip(mask_prime, dims=[1])]
-                cos, sin = cos_prime.unsqueeze(1), sin_prime.unsqueeze(1)
             # NOTE: `:s` in cos is required cuz for encoder blocks s=L0 and cos.shape[2]=L0+L
             # The same for sin and key_padding_mask
             if s > l:  # text_decoder block
@@ -120,7 +80,7 @@ class MultiheadAttention(nn.Module):
             k, v = kv_cache.insert_kv(0, k, v)
 
         if key_padding_mask is not None:
-            # NOTE: key_padding_mask is used during pre-training
+            # NOTE: key_padding_mask is used during training
             key_mask_expanded = key_padding_mask[:, :s].view(b, 1, 1, s).expand(-1, self.n_head, -1, -1)
             query_mask = torch.zeros((1, 1, l, s), device=q.device) if attn_mask is None else attn_mask.view(1, 1, l, s)
             attn_mask = query_mask.expand(b, self.n_head, -1, -1) + key_mask_expanded
@@ -131,8 +91,6 @@ class MultiheadAttention(nn.Module):
         else:  # when decoding, qkv=(b, n_head, 1, head_dim) != v_proj=(b, n_head, lk, head_dim)
             vn = F.normalize(v[:, :, [-1], :], dim=-1, eps=1e-9)
         qkv = qkv - torch.sum(qkv * vn, dim=-1, keepdim=True) * vn
-        # beta = 2 * torch.sigmoid(self.beta(query))  # (b, l, n_head)
-        # qkv = qkv - beta.transpose(1, 2).unsqueeze(-1) * torch.sum(qkv * vn, dim=-1, keepdim=True) * vn  # Householder-like transition
 
         qkv = qkv.permute(0, 2, 1, 3).flatten(start_dim=2)
         return self.dropout(self.out_proj(qkv)), _
@@ -158,11 +116,11 @@ class ResidualAttentionBlock(nn.Module):
         """
         x_norm = self.sa_norm(x)
         if img_enc is None:
-            memory = x_norm
+            content = x_norm
         else:
-            memory = torch.cat([self.sa_norm(img_enc), x_norm], dim=1)
+            content = torch.cat([self.sa_norm(img_enc), x_norm], dim=1)
 
-        x = x + self.sa(x_norm, memory, memory, cos_sin, attn_mask, key_padding_mask, kv_cache)[0]
+        x = x + self.sa(x_norm, content, cos_sin, attn_mask, key_padding_mask, kv_cache)[0]
         x = x + self.mlp(self.mlp_norm(x))
         return x
 
@@ -224,39 +182,57 @@ class TrorYongOCRModel(
         patch tensor (b, L0, patch_dim)
         input_ids including bos (b, L)
         target_ids including eos (b, L)
-        patch masks (b, L0)
+        patch masks (b, L0), True means NOT to mask
         """
+        L0 = patch_tensor.shape[1]
+        b, L = input_ids.shape
+        S = L0 + L
+
         query = self.dropout(self.tok_embed(input_ids))
         if kv_cache is None or kv_cache.kv_cache is None:
+            cos, sin = self.cos[:, :, :S], self.sin[:, :, :S]
 
             if patch_masks is not None:
                 patch_tensor = patch_tensor * patch_masks.unsqueeze(-1)
+
                 pat_padding_mask = torch.zeros_like(patch_masks, dtype=torch.float32)
-                pat_padding_mask.masked_fill_(~patch_masks, -float('inf'))
+                pat_padding_mask.masked_fill_(~patch_masks, -float('inf'))  # 0 means NOT to mask
+
                 chr_padding_mask = torch.zeros_like(input_ids, dtype=torch.float32)
                 chr_padding_mask.masked_fill_(input_ids == self.config.pad_id, -float('inf'))
                 key_padding_mask = torch.cat([pat_padding_mask, chr_padding_mask], dim=1)
+
+                # NOTE: shift rotation due to padding patches
+                mask_prime = torch.ones_like(key_padding_mask, dtype=torch.bool)
+                mask_prime[:, :L0].masked_fill_(~patch_masks, False)  # shift rotation on padding patches
+                mask_prime = mask_prime.unsqueeze(-1).expand(-1, -1, cos.shape[-1])  # [b, s, head_dim]
+
+                # initialize all positions with null rotation
+                cos_prime = torch.full_like(mask_prime, fill_value=1.0, dtype=cos.dtype, device=cos.device)
+                sin_prime = torch.full_like(mask_prime, fill_value=0.0, dtype=sin.dtype, device=sin.device)
+
+                # mask_prime has False at the beginning (padding patches)
+                # So, torch.flip pushes False to the end
+                cos_prime[mask_prime] = cos.squeeze(1).expand(b, -1, -1)[torch.flip(mask_prime, dims=[1])]
+                sin_prime[mask_prime] = sin.squeeze(1).expand(b, -1, -1)[torch.flip(mask_prime, dims=[1])]
+                cos, sin = cos_prime.unsqueeze(1), sin_prime.unsqueeze(1)
+
             else:
                 key_padding_mask = None
 
+            cos_sin = cos, sin
             img_enc = self.dropout(self.patch_embed(patch_tensor))
-            L0, L = patch_tensor.shape[1], input_ids.shape[1]
-            S = L0 + L
-            cos_sin = self.cos[:, :, :S], self.sin[:, :, :S]
             for block in self.blocks:
-                img_enc = block(img_enc, cos_sin=cos_sin, key_padding_mask=key_padding_mask)  # regular encoding layer to encode image
+                img_enc = block(img_enc, cos_sin=cos_sin, key_padding_mask=key_padding_mask)
 
-            # decoding layer
-            # all character tokens must communicate with all image encoding
+            # every character token communicates with all image patches
             mask = self.mask[L0:S, :S]
-
             query = self.txt_decoder(query, img_enc=img_enc, cos_sin=cos_sin, attn_mask=mask, key_padding_mask=key_padding_mask, kv_cache=kv_cache)
         else:
             S0 = kv_cache.get_pos()
-            mask = self.mask[[S0], :S0+1]
             cos_sin = self.cos[:, :, [S0]], self.sin[:, :, [S0]]
 
-            query = self.txt_decoder(query, cos_sin=cos_sin, attn_mask=mask, kv_cache=kv_cache)
+            query = self.txt_decoder(query, cos_sin=cos_sin, kv_cache=kv_cache)
 
         if target_ids is not None:
             logits = self.lm_head(norm(query))  # (b, L, n_vocab)
