@@ -60,7 +60,7 @@ class MultiheadAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         return q
 
-    def kv_projection(self, k, v, cos, sin, kv_cache=None):
+    def kv_projection(self, k, v, cos, sin):
         """
         Compute and return the projection of key and value
         """
@@ -70,8 +70,6 @@ class MultiheadAttention(nn.Module):
         k = apply_rotary_emb(k, cos, sin)
         v = self.v_proj(v)
         v = v.view(*v.shape[:2], self.n_head, self.head_dim).transpose(1, 2)
-        if kv_cache is not None:  # only self_attn use kv_cache
-            k, v = kv_cache.insert_kv(0, k, v)  # there is only one layer, so layer_idx=0
         return k, v
 
     def qkv_projection(self, query, key, value, cos_sin, kv_cache=None):
@@ -81,7 +79,18 @@ class MultiheadAttention(nn.Module):
         # apply LARoPE
         q_cos, q_sin, k_cos, k_sin = cos_sin
         q_proj = self.q_projection(query, q_cos, q_sin)
-        k_proj, v_proj = self.kv_projection(key, value, k_cos, k_sin, kv_cache)
+        if kv_cache is None:
+            k_proj, v_proj = self.kv_projection(key, value, k_cos, k_sin)
+        else:
+            if not self.is_ca or 'key' not in kv_cache:
+                k_proj, v_proj = self.kv_projection(key, value, k_cos, k_sin, kv_cache)
+                if self.is_ca:
+                    kv_cache['key'] = k_proj
+                    kv_cache['value'] = v_proj
+                else:
+                    k_proj, v_proj = kv_cache.insert_kv(0, k_proj, v_proj)  # there is only one layer, so layer_idx=0
+            else:
+                k_proj, v_proj = kv_cache['key'], kv_cache['value']
         return q_proj, k_proj, v_proj
 
     def attention_forward(self, q_proj, k_proj, v_proj, attn_mask=None, key_padding_mask=None):
@@ -149,7 +158,7 @@ class DecoderBlock(nn.Module):
         res = res + self.mlp(self.mlp_norm(res))
         return res
 
-    def forward(self, q, ctx, aud, sa_cos_sin, attn_mask, ca_cos_sin, key_padding_mask=None, kv_cache=None):
+    def forward(self, q, ctx, aud, sa_cos_sin, attn_mask, ca_cos_sin, key_padding_mask=None, kv_cache=(None, None)):
         """
         regular forward pass
         WARN: q must be unnormalized in order to do residual connection
@@ -157,9 +166,9 @@ class DecoderBlock(nn.Module):
         right before attention forward
         """
         # NOTE: q is not normalized when passing to self_attn because it is q_projection already, and I only apply rotation.
-        query, sa_weights = self.self_attn(q, ctx, ctx, sa_cos_sin, attn_mask, key_padding_mask, kv_cache)
+        query, sa_weights = self.self_attn(q, ctx, ctx, sa_cos_sin, attn_mask, key_padding_mask, kv_cache[0])
         res = q + query
-        query, ca_weights = self.cross_attn(self.ca_norm(res), aud, aud, ca_cos_sin)
+        query, ca_weights = self.cross_attn(self.ca_norm(res), aud, aud, ca_cos_sin, kv_cache[1])
         res = res + query
         res = res + self.mlp(self.mlp_norm(res))
         return res
@@ -246,7 +255,7 @@ class TrorYongASRModel(
     def encode(self, mels: Tensor) -> Tensor:
         return self.encoder(mels)
 
-    def forward(self, mels, input_ids, target_ids=None):
+    def forward(self, mels, input_ids, target_ids=None, kv_cache=(None, None)):
         """
         mels: log-mel spectrum from audio array
         input_ids: input token ids for decoder (inclu. sot sequence)
@@ -279,7 +288,7 @@ class TrorYongASRModel(
         ca_cos_sin = q_cos, q_sin, k_cos, k_sin
 
         attn_mask = self.mask[:L, :L]
-        res = self.decoder(q, ctx, aud, sa_cos_sin, attn_mask, ca_cos_sin, key_padding_mask)
+        res = self.decoder(q, ctx, aud, sa_cos_sin, attn_mask, ca_cos_sin, key_padding_mask, kv_cache)
         logits = self.lm_head(norm(res))  # (b, L, pad_vocab_size)
         if target_ids is not None:
             loss = F.cross_entropy(logits.flatten(end_dim=1).float(), target_ids.flatten(), ignore_index=-100, reduction='mean')
