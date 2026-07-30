@@ -83,7 +83,7 @@ class MultiheadAttention(nn.Module):
             k_proj, v_proj = self.kv_projection(key, value, k_cos, k_sin)
         else:
             if not self.is_ca or 'key' not in kv_cache:
-                k_proj, v_proj = self.kv_projection(key, value, k_cos, k_sin, kv_cache)
+                k_proj, v_proj = self.kv_projection(key, value, k_cos, k_sin)
                 if self.is_ca:
                     kv_cache['key'] = k_proj
                     kv_cache['value'] = v_proj
@@ -168,7 +168,7 @@ class DecoderBlock(nn.Module):
         # NOTE: q is not normalized when passing to self_attn because it is q_projection already, and I only apply rotation.
         query, sa_weights = self.self_attn(q, ctx, ctx, sa_cos_sin, attn_mask, key_padding_mask, kv_cache[0])
         res = q + query
-        query, ca_weights = self.cross_attn(self.ca_norm(res), aud, aud, ca_cos_sin, kv_cache[1])
+        query, ca_weights = self.cross_attn(self.ca_norm(res), aud, aud, ca_cos_sin, kv_cache=kv_cache[1])
         res = res + query
         res = res + self.mlp(self.mlp_norm(res))
         return res
@@ -255,12 +255,57 @@ class TrorYongASRModel(
     def encode(self, mels: Tensor) -> Tensor:
         return self.encoder(mels)
 
+    def logits(self, aud_enc: Tensor, input_ids: Tensor, pred_seq_len: int=0, kv_cache=(None, None)):
+        T0 = 0 if kv_cache[0] is None else kv_cache[0].get_pos()
+
+        # decoding layer
+        b, L = input_ids.size()
+        T1 = T0 + L
+        assert T1 <= self.config.n_text_ctx, "input_ids is too long"
+
+        q = self.pos_basis.expand(b, L, -1)
+        ctx = self.get_token_embedding(input_ids)
+        if L > 1:  # always True during training. During inference, True for the first token
+            ctx = ctx + F.pad(q[:, T0:T1-1], (0, 0, 1, 0, 0, 0))
+        elif T0 > 0:  # During inference, from the second token onward
+            ctx = ctx + q
+        ctx = self.dropout(ctx)
+        ctx = norm(ctx)
+
+        # T1+1 because Q is one-phase faster than K
+        sa_cos_sin = self.cos[:, :, T0+1:T1+1], self.sin[:, :, T0+1:T1+1], self.cos[:, :, T0:T1], self.sin[:, :, T0:T1]
+
+        if pred_seq_len == 0:
+            conditions = input_ids != self.config.pad_id
+            key_padding_mask = torch.zeros((b, L), device=self.device)
+            key_padding_mask.masked_fill_(~conditions, -float('inf'))
+            actual_seq_len = torch.sum(conditions, dim=-1, dtype=torch.float32) # (b, )
+            seq_len = L
+        else:
+            actual_seq_len = None
+            key_padding_mask = None
+            seq_len = pred_seq_len if T1 < pred_seq_len else T1
+
+        q_cos, q_sin = self.compute_cos_sin(seq_len, self.device, actual_seq_len)
+        k_cos, k_sin = self.compute_cos_sin(aud_enc.shape[1], self.device)
+        ca_cos_sin = q_cos[:, :, T0:T1], q_sin[:, :, T0:T1], k_cos, k_sin
+
+        attn_mask = self.mask[T0:T0+L, T0:T0+L]
+        res = self.decoder(q, ctx, aud_enc, sa_cos_sin, attn_mask, ca_cos_sin, key_padding_mask, kv_cache)
+        return self.lm_head(norm(res))  # (b, L, pad_vocab_size)
+
+    def len_logits(self, aud_enc: Tensor):
+        x = aud_enc.detach().transpose(1, 2)
+        x = F.adaptive_avg_pool1d(F.gelu(self.conv3(x)), 1).squeeze(-1)
+        return self.lp_head(x)
+
     def forward(self, mels, input_ids, target_ids=None, kv_cache=(None, None)):
         """
         mels: log-mel spectrum from audio array
         input_ids: input token ids for decoder (inclu. sot sequence)
         target_ids: target token ids to compute cross_entropy loss
         """
+        # TODO: rethinking about seq-len prediction as it varies over tasks
 
         # decoding layer
         b, L = input_ids.size()
@@ -339,19 +384,25 @@ class TrorYongASRModel(
         self.prefix = prefix
 
     @torch.inference_mode()
-    def detect_language(self, mels: Tensor, tokenizer):
+    def detect_language(self, mels: Tensor, tokenizer, kv_cache):
         """
         Predicting the language of audio
         NOTE: I could have called `forward` but there is a careful attention required for cos, sin
         """
         mels = mels.unsqueeze(0)
+        aud_enc = self.encoder(mels)
+
+        # predict seq_len
+        len_logits = self.len_logits(aud_enc)
+        len_logits[:, :2] = -float('inf') # no sequence has length shorter than 2
+        pred_seq_len = len_logits.argmax(dim=-1).item()
 
         idx = torch.as_tensor([[tokenizer.sot]], dtype=torch.long, device=self.device)
-        logits = self.forward(mels, idx).logits
+        logits = self.logits(aud_enc, idx, pred_seq_len)
 
         # suppress non-language tokens
         mask = torch.ones(logits.shape[-1], dtype=torch.bool)
-        mask[list(tokenizer.all_language_tokens)] = False
+        mask[list(tokenizer.all_language_tokens) + [tokenizer.no_speech]] = False
         logits[:, -1, mask] = -float('inf')
         language_tokens = logits.argmax(dim=-1)
         language_token_probs = F.softmax(logits, dim=-1)
@@ -361,6 +412,7 @@ class TrorYongASRModel(
                 for j, c in zip(tokenizer.all_language_tokens, tokenizer.all_language_codes)
             }
         ]
+        language_probs[0]['no_speech'] = language_token_probs[0, 0, tokenizer.no_speech].item()
 
         return language_tokens[0], language_probs[0]
 
@@ -373,9 +425,12 @@ class TrorYongASRModel(
         if self.prefix is None:
             raise SyntaxError("Please provide bos, language, and task tokens as prefix using set_prefix before calling decode.")
 
-        seq_len = self.mask.shape[0]
-        assert max_tokens <= seq_len, "too long sequence generation, consider lower max_tokens"
-        kv_cache = KVCache(1, self.n_head, seq_len, self.head_dim, 1) # batch_size=1, num_layers=1
+        max_seq_len = self.config.n_text_ctx
+        assert max_tokens <= max_seq_len, "too long sequence generation, consider lower max_tokens"
+        kv_cache = [
+            KVCache(1, self.n_head, max_seq_len, self.head_dim, 1), # batch_size=1, num_layers=1
+            dict()
+        ]
         device = self.device
         rng = None
         if temperature > 0:
@@ -383,37 +438,19 @@ class TrorYongASRModel(
             rng.manual_seed(seed)
 
         mels = mels.unsqueeze(0)
-        aud = self.encoder(mels)
-        aud_k_proj, aud_v_proj = self.decoder.cross_attn.kv_projection(aud, aud)
+        aud_enc = self.encoder(mels)
+
+        # predict seq_len
+        len_logits = self.len_logits(aud_enc)
+        len_logits[:, :2] = -float('inf') # no sequence has length shorter than 2
+        pred_seq_len = len_logits.argmax(dim=-1).item()
 
         idx = torch.as_tensor([self.prefix], dtype=torch.long, device=mels.device)
         n = idx.shape[1]
-        idx_next = None
-        pos_query = self.pos_basis.view(1, 1, -1)
+        idx_next = idx
+
         for i in range(n, max_tokens):
-            if i == n:
-                q = pos_query.expand(-1, i, -1)
-                ctx = self.get_token_embedding(idx)
-                cos_sin = self.cos[:, :, :i+1], self.sin[:, :, :i+1]
-                mask = self.mask[:i, :i]
-            else:
-                q = pos_query
-                ctx = self.get_token_embedding(idx_next)
-                cos_sin = self.cos[:, :, i-1:i+1], self.sin[:, :, i-1:i+1]
-                mask = self.mask[[i-1], :i]
-            ctx = norm(ctx)
-
-            # q_proj, k_proj, v_proj = self.decoder.self_attn.qkv_projection(norm(q), ctx, ctx, cos_sin, kv_cache=kv_cache)
-            # res = self.decoder.forward_self_attn(q, q_proj, k_proj, v_proj, mask)
-            # NOTE: The 2 lines below are equivalent to the 2 lines above
-            # q is not normalized because it is q_projectioin already and I only apply rotation.
-            query, sa_weights = self.decoder.self_attn(q, ctx, ctx, cos_sin, mask, kv_cache=kv_cache)
-            res = q + query
-
-            res_q_proj = self.decoder.cross_attn.q_projection(self.decoder.ca_norm(res))
-            res = self.decoder.forward_cross_attn_and_mlp(res, res_q_proj, aud_k_proj, aud_v_proj)
-
-            logits = self.lm_head(norm(res[:, [-1], :])).float()
+            logits = self.logits(aud_enc, idx_next, pred_seq_len, kv_cache)
             logits[:, -1, self.vocab_size:] = -float('inf') # suppress the pad tokens
 
             if temperature > 0:
@@ -424,7 +461,7 @@ class TrorYongASRModel(
                 probs = F.softmax(logits, dim=-1)
                 idx_next = torch.multinomial(probs, num_samples=1, generator=rng)
             else:
-                idx_next = logits.argmax(dim=-1)
+                idx_next = logits[:, [-1], :].argmax(dim=-1)
             idx = torch.cat((idx, idx_next), dim=1)
             if idx_next.item() == self.config.eot_id:
                 break
