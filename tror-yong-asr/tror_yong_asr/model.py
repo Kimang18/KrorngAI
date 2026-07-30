@@ -255,7 +255,7 @@ class TrorYongASRModel(
     def encode(self, mels: Tensor) -> Tensor:
         return self.encoder(mels)
 
-    def logits(self, aud_enc: Tensor, input_ids: Tensor, pred_seq_len: int=0, kv_cache=(None, None)):
+    def logits(self, aud_enc: Tensor, input_ids: Tensor, pred_seq_len: float=0.0, kv_cache=(None, None)):
         T0 = 0 if kv_cache[0] is None else kv_cache[0].get_pos()
 
         # decoding layer
@@ -275,7 +275,7 @@ class TrorYongASRModel(
         # T1+1 because Q is one-phase faster than K
         sa_cos_sin = self.cos[:, :, T0+1:T1+1], self.sin[:, :, T0+1:T1+1], self.cos[:, :, T0:T1], self.sin[:, :, T0:T1]
 
-        if pred_seq_len == 0:
+        if pred_seq_len == 0.0:
             conditions = input_ids != self.config.pad_id
             key_padding_mask = torch.zeros((b, L), device=self.device)
             key_padding_mask.masked_fill_(~conditions, -float('inf'))
@@ -295,11 +295,11 @@ class TrorYongASRModel(
         return self.lm_head(norm(res))  # (b, L, pad_vocab_size)
 
     def len_logits(self, aud_enc: Tensor):
-        x = aud_enc.detach().transpose(1, 2)
+        x = aud_enc.transpose(1, 2)
         x = F.adaptive_avg_pool1d(F.gelu(self.conv3(x)), 1).squeeze(-1)
         return self.lp_head(x)
 
-    def forward(self, mels, input_ids, target_ids=None, kv_cache=(None, None)):
+    def forward(self, mels, input_ids, target_ids=None):
         """
         mels: log-mel spectrum from audio array
         input_ids: input token ids for decoder (inclu. sot sequence)
@@ -307,41 +307,15 @@ class TrorYongASRModel(
         """
         # TODO: rethinking about seq-len prediction as it varies over tasks
 
-        # decoding layer
-        b, L = input_ids.size()
-        assert L <= self.config.n_text_ctx, "input_ids is too long"
-
         # NOTE: in Whisper Audio Encoder, the audio encoding is already normalized by ln_post()
-        aud = self.encoder(mels)
-
-        q = self.pos_basis.expand(b, L, -1)
-        ctx = self.get_token_embedding(input_ids)
-        ctx = ctx + F.pad(q[:, :L-1], (0, 0, 1, 0, 0, 0))
-        ctx = self.dropout(ctx)
-        ctx = norm(ctx)
-
-        # L+1 because Q is one-phase faster than K
-        sa_cos_sin = self.cos[:, :, 1:L+1], self.sin[:, :, 1:L+1], self.cos[:, :, :L], self.sin[:, :, :L]
-
-        conditions = input_ids != self.config.pad_id
-        key_padding_mask = torch.zeros((b, L), device=self.device)
-        key_padding_mask.masked_fill_(~conditions, -float('inf'))
-        actual_seq_len = torch.sum(conditions, dim=-1, dtype=torch.float32) # (b, )
-
-        q_cos, q_sin = self.compute_cos_sin(L, self.device, actual_seq_len)
-        k_cos, k_sin = self.compute_cos_sin(self.config.n_audio_ctx, self.device)
-        ca_cos_sin = q_cos, q_sin, k_cos, k_sin
-
-        attn_mask = self.mask[:L, :L]
-        res = self.decoder(q, ctx, aud, sa_cos_sin, attn_mask, ca_cos_sin, key_padding_mask, kv_cache)
-        logits = self.lm_head(norm(res))  # (b, L, pad_vocab_size)
+        aud_enc = self.encoder(mels)
+        logits = self.logits(aud_enc, input_ids)  # (b, L, pad_vocab_size)
         if target_ids is not None:
             loss = F.cross_entropy(logits.flatten(end_dim=1).float(), target_ids.flatten(), ignore_index=-100, reduction='mean')
 
             # predict sequence length
-            x = aud.detach().transpose(1, 2)  #(b, n_embed, n_audio_ctx)
-            x = F.adaptive_avg_pool1d(F.gelu(self.conv3(x)), 1).squeeze(-1) #(b, n_embed)
-            len_logits = self.lp_head(x)
+            len_logits = self.len_logits(aud_enc.detach())
+            actual_seq_len = torch.sum(input_ids != self.config.pad_id, dim=-1, dtype=torch.float32) # (b, )
             target_len = actual_seq_len.detach().clone().to(torch.long)
 
             loss += self.lp_factor * F.cross_entropy(len_logits, target_len, label_smoothing=0.05)
