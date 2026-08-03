@@ -174,6 +174,21 @@ class DecoderBlock(nn.Module):
         return res
 
 
+class CrossAttnLengthPredictor(nn.Module):
+    def __init__(self, n_embed: int, n_head: int, dim_feedforward: int, dropout: float, bias: bool):
+        super().__init__()
+        self.cross_attn = MultiheadAttention(n_embed, n_head, dropout, bias, is_ca=True)
+        self.ca_norm = DerfWrapper(n_embed)
+        self.mlp = MLP(n_embed, dim_feedforward, dropout, bias)
+        self.mlp_norm = DerfWrapper(n_embed)
+
+    def forward(self, aud_enc: Tensor, task_embed: Tensor, cos_sin):
+        query, sa_weights = self.cross_attn(self.ca_norm(task_embed), aud_enc, aud_enc, cos_sin)
+        res = task_embed + query
+        res = res + self.mlp(self.mlp_norm(res))
+        return res
+
+
 @dataclass
 class TrorYongASRConfig:
     vocab_size: int  # use the tokenizer's vocab size
@@ -209,8 +224,7 @@ class TrorYongASRModel(
         # decoder's head is twice the head of encoder
         self.n_head = 2 * config.n_head
         self.head_dim = config.n_embed // self.n_head
-        self.rotary_seq_len = 10 * config.n_text_ctx
-        cos, sin = precompute_rotary_emb(self.rotary_seq_len, self.head_dim, device=self.device)
+        cos, sin = precompute_rotary_emb(config.n_text_ctx, self.head_dim, device=self.device)
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
 
@@ -238,9 +252,12 @@ class TrorYongASRModel(
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
         # Sequence Length Predictor, used for LARoPE's inference
+        # self.ca_len_predictor = CrossAttnLengthPredictor(config.n_embed, self.n_head, mlp_dim, config.dropout, config.bias)
+        # self.head_len_predictor = LinearWrapper(config.n_embed, config.n_text_ctx) # seq length predictor specific to LARoPE
+
         self.conv3 = Conv1dWrapper(config.n_embed, config.n_embed, kernel_size=5, stride=5)
-        self.lp_head = LinearWrapper(config.n_embed, config.n_text_ctx) # sequence length predictor specific to LARoPE
-        self.lp_factor = 0.5  # weight of length prediciton loss
+        self.len_predictor_head = LinearWrapper(config.n_embed, config.n_text_ctx) # sequence length predictor specific to LARoPE
+        self.lp_factor = 1.0  # weight of length prediciton loss
 
         mask = torch.empty(config.n_text_ctx, config.n_text_ctx).fill_(-float('inf')).triu_(1)
         self.register_buffer("mask", mask, persistent=False)
@@ -255,17 +272,22 @@ class TrorYongASRModel(
     def encode(self, mels: Tensor) -> Tensor:
         return self.encoder(mels)
 
-    def logits(self, aud_enc: Tensor, input_ids: Tensor, pred_seq_len: float=0.0, kv_cache=(None, None)):
+    def logits(self, aud_enc: Tensor, tok_embed: Tensor, tok_mask: Optional[Tensor]=None, pred_seq_len: float=0.0, kv_cache=(None, None)):
+        """
+        tok_mask: True means do not mask, False means to be masked
+        """
         T0 = 0 if kv_cache[0] is None else kv_cache[0].get_pos()
 
         # decoding layer
-        b, L = input_ids.size()
+        b, L, _ = tok_embed.size()
         T1 = T0 + L
         assert T1 <= self.config.n_text_ctx, "input_ids is too long"
 
+        attn_mask = None
         q = self.pos_basis.expand(b, L, -1)
-        ctx = self.get_token_embedding(input_ids)
+        ctx = tok_embed
         if L > 1:  # always True during training. During inference, True for the first token
+            attn_mask = self.mask[T0:T1, T0:T1]
             ctx = ctx + F.pad(q[:, T0:T1-1], (0, 0, 1, 0, 0, 0))
         elif T0 > 0:  # During inference, from the second token onward
             ctx = ctx + q
@@ -276,10 +298,9 @@ class TrorYongASRModel(
         sa_cos_sin = self.cos[:, :, T0+1:T1+1], self.sin[:, :, T0+1:T1+1], self.cos[:, :, T0:T1], self.sin[:, :, T0:T1]
 
         if pred_seq_len == 0.0:
-            conditions = input_ids != self.config.pad_id
             key_padding_mask = torch.zeros((b, L), device=self.device)
-            key_padding_mask.masked_fill_(~conditions, -float('inf'))
-            actual_seq_len = torch.sum(conditions, dim=-1, dtype=torch.float32) # (b, )
+            key_padding_mask.masked_fill_(~tok_mask, -float('inf'))
+            actual_seq_len = torch.sum(tok_mask, dim=-1, dtype=torch.float32) # (b, )
             seq_len = L
         else:
             actual_seq_len = None
@@ -290,14 +311,20 @@ class TrorYongASRModel(
         k_cos, k_sin = self.compute_cos_sin(aud_enc.shape[1], self.device)
         ca_cos_sin = q_cos[:, :, T0:T1], q_sin[:, :, T0:T1], k_cos, k_sin
 
-        attn_mask = self.mask[T0:T0+L, T0:T0+L]
         res = self.decoder(q, ctx, aud_enc, sa_cos_sin, attn_mask, ca_cos_sin, key_padding_mask, kv_cache)
-        return self.lm_head(norm(res))  # (b, L, pad_vocab_size)
+        return self.lm_head(res)  # (b, L, pad_vocab_size)
+        # return self.lm_head(norm(res))  # (b, L, pad_vocab_size)
 
-    def len_logits(self, aud_enc: Tensor):
+    def len_logits(self, aud_enc: Tensor, task_embed: Tensor):
+        # k_cos, k_sin = self.compute_cos_sin(aud_enc.shape[1], self.device)
+        # cos_sin = self.cos[:, :, :1], self.sin[:, :, :1], k_cos, k_sin
+        # res = self.ca_len_predictor(aud_enc, task_embed, cos_sin)
+        # return self.head_len_predictor(norm(res))
+
         x = aud_enc.transpose(1, 2)
         x = F.adaptive_avg_pool1d(F.gelu(self.conv3(x)), 1).squeeze(-1)
-        return self.lp_head(x)
+        x = x + task_embed.squeeze(1)
+        return self.len_predictor_head(norm(x))
 
     def forward(self, mels, input_ids, target_ids=None):
         """
@@ -309,14 +336,16 @@ class TrorYongASRModel(
 
         # NOTE: in Whisper Audio Encoder, the audio encoding is already normalized by ln_post()
         aud_enc = self.encoder(mels)
-        logits = self.logits(aud_enc, input_ids)  # (b, L, pad_vocab_size)
+        tok_mask = input_ids != self.config.pad_id
+        tok_embed = self.get_token_embedding(input_ids)
+        task_embed = tok_embed[:, [2]].detach().clone()
+        logits = self.logits(aud_enc, tok_embed, tok_mask)  # (b, L, pad_vocab_size)
         if target_ids is not None:
             loss = F.cross_entropy(logits.flatten(end_dim=1).float(), target_ids.flatten(), ignore_index=-100, reduction='mean')
 
             # predict sequence length
-            len_logits = self.len_logits(aud_enc.detach())
-            actual_seq_len = torch.sum(input_ids != self.config.pad_id, dim=-1, dtype=torch.float32) # (b, )
-            target_len = actual_seq_len.detach().clone().to(torch.long)
+            len_logits = self.len_logits(aud_enc.detach(), task_embed)
+            target_len = torch.sum(tok_mask, dim=-1, dtype=torch.long)
 
             loss += self.lp_factor * F.cross_entropy(len_logits, target_len, label_smoothing=0.05)
 
@@ -366,13 +395,9 @@ class TrorYongASRModel(
         mels = mels.unsqueeze(0)
         aud_enc = self.encoder(mels)
 
-        # predict seq_len
-        len_logits = self.len_logits(aud_enc)
-        len_logits[:, :2] = -float('inf') # no sequence has length shorter than 2
-        pred_seq_len = len_logits.argmax(dim=-1).item()
-
         idx = torch.as_tensor([[tokenizer.sot]], dtype=torch.long, device=self.device)
-        logits = self.logits(aud_enc, idx, pred_seq_len)
+        tok_embed = self.get_token_embedding(idx)
+        logits = self.logits(aud_enc, tok_embed, pred_seq_len=1.0)
 
         # suppress non-language tokens
         mask = torch.ones(logits.shape[-1], dtype=torch.bool)
@@ -413,18 +438,21 @@ class TrorYongASRModel(
 
         mels = mels.unsqueeze(0)
         aud_enc = self.encoder(mels)
+        idx = torch.as_tensor([self.prefix], dtype=torch.long, device=mels.device)
+        tok_embed = self.get_token_embedding(idx)
+        n = idx.shape[1]
 
         # predict seq_len
-        len_logits = self.len_logits(aud_enc)
+        len_logits = self.len_logits(aud_enc, tok_embed[:, [2]].clone())
         len_logits[:, :2] = -float('inf') # no sequence has length shorter than 2
-        pred_seq_len = len_logits.argmax(dim=-1).item()
+        # pred_seq_len = len_logits.argmax(dim=-1).item()
+        prob_len = F.softmax(len_logits, dim=-1)
+        indices = torch.arange(len_logits.size(-1), device=self.device, dtype=torch.float32)
+        pred_seq_len = torch.sum(prob_len * indices, dim=-1).item()
 
-        idx = torch.as_tensor([self.prefix], dtype=torch.long, device=mels.device)
-        n = idx.shape[1]
-        idx_next = idx
-
+        next_embed = tok_embed
         for i in range(n, max_tokens):
-            logits = self.logits(aud_enc, idx_next, pred_seq_len, kv_cache)
+            logits = self.logits(aud_enc, next_embed, pred_seq_len=pred_seq_len, kv_cache=kv_cache)
             logits[:, -1, self.vocab_size:] = -float('inf') # suppress the pad tokens
 
             if temperature > 0:
@@ -433,21 +461,19 @@ class TrorYongASRModel(
                     v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                     logits[logits < v[:, [-1]]] = -float('inf')
                 probs = F.softmax(logits, dim=-1)
-                idx_next = torch.multinomial(probs, num_samples=1, generator=rng)
+                id_next = torch.multinomial(probs, num_samples=1, generator=rng)
             else:
-                idx_next = logits[:, [-1], :].argmax(dim=-1)
-            idx = torch.cat((idx, idx_next), dim=1)
-            if idx_next.item() == self.config.eot_id:
+                id_next = logits[:, [-1], :].argmax(dim=-1)
+            idx = torch.cat((idx, id_next), dim=1)
+            if id_next.item() == self.config.eot_id:
                 break
+            next_embed = self.get_token_embedding(id_next)
         return idx
 
     @torch.no_grad()
     def init_weights(self):
         nn.init.normal_(self.encoder.conv1.weight, mean=0.0, std=0.02)
         nn.init.normal_(self.encoder.conv2.weight, mean=0.0, std=0.02)
-
-        nn.init.kaiming_normal_(self.conv3.weight, mode='fan_out', nonlinearity='relu')
-        nn.init.trunc_normal_(self.lp_head.weight, mean=0.0, std=0.02)
 
         s = 3**0.5 * self.config.n_embed**-0.5
         for block in self.encoder.blocks:
@@ -471,6 +497,18 @@ class TrorYongASRModel(
         nn.init.uniform_(self.decoder.mlp.up_proj.weight, -s * 0.4, s * 0.4)
         nn.init.zeros_(self.decoder.mlp.down_proj.weight)
 
+        # nn.init.uniform_(self.ca_len_predictor.cross_attn.q_proj.weight, -s, s)
+        # nn.init.uniform_(self.ca_len_predictor.cross_attn.k_proj.weight, -s, s)
+        # nn.init.uniform_(self.ca_len_predictor.cross_attn.v_proj.weight, -s, s)
+        # nn.init.zeros_(self.ca_len_predictor.cross_attn.out_proj.weight)
+
+        # nn.init.uniform_(self.ca_len_predictor.mlp.gate_proj.weight, -s * 0.4, s * 0.4)
+        # nn.init.uniform_(self.ca_len_predictor.mlp.up_proj.weight, -s * 0.4, s * 0.4)
+        # nn.init.zeros_(self.ca_len_predictor.mlp.down_proj.weight)
+
+        nn.init.kaiming_normal_(self.conv3.weight, mode='fan_out', nonlinearity='relu')
+        nn.init.trunc_normal_(self.len_predictor_head.weight, mean=0.0, std=0.02)
+
         # Embedding
         nn.init.normal_(self.tok_embed.weight, mean=0.0, std=0.001)
         # tie token embedding
@@ -480,8 +518,11 @@ class TrorYongASRModel(
         nn.init.trunc_normal_(self.pos_basis, std=1.0)
 
         # Rotary embeddings
-        cos, sin = precompute_rotary_emb(self.rotary_seq_len, self.head_dim, device=self.device)
+        cos, sin = precompute_rotary_emb(self.config.n_text_ctx, self.head_dim, device=self.device)
         self.cos, self.sin = cos, sin
+        self.inv_freq = 1.0 / (
+            1e4 ** (torch.arange(0, self.head_dim, 2, dtype=torch.float32) / self.head_dim)
+        )
 
         self.mask = torch.empty(self.config.n_text_ctx, self.config.n_text_ctx).fill_(-float('inf')).triu_(1)
 
