@@ -36,22 +36,22 @@ class MultiHeadAttention(nn.Module):
     def forward(
             self,
             x: Tensor,
-            kv_cache: Optional[dict] = None,
+            key_mask: Optional[Tensor] = None,
         ):
         q = self.query(x)
-        if kv_cache is None or self.key not in kv_cache:
-            k = self.key(x)
-            v = self.value(x)
-        else:
-            k = kv_cache[self.key]
-            v = kv_cache[self.value]
+        k = self.key(x)
+        v = self.value(x)
 
         q = q.view(*q.shape[:2], self.n_head, -1).permute(0, 2, 1, 3)
         k = k.view(*k.shape[:2], self.n_head, -1).permute(0, 2, 1, 3)
         v = v.view(*v.shape[:2], self.n_head, -1).permute(0, 2, 1, 3)
         # q, k = norm(q), norm(k)
+        attn_mask = None
+        if key_mask is not None:
+            b, L = key_mask.shape
+            attn_mask = key_mask.view(b, 1, 1, L).expand(-1, self.n_head, L, -1)
 
-        qkv = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+        qkv = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=False)
         qkv = qkv.permute(0, 2, 1, 3).flatten(start_dim=2)
 
         return self.out(qkv), None
@@ -68,8 +68,8 @@ class ResidualAttentionBlock(nn.Module):
         )
         self.mlp_ln = LayerNormWrapper(n_embed)
 
-    def forward(self, x: Tensor, kv_cache: Optional[dict] = None):
-        x = x + self.attn(self.attn_ln(x), kv_cache=kv_cache)[0]
+    def forward(self, x: Tensor, mask: Optional[Tensor] = None):
+        x = x + self.attn(self.attn_ln(x), mask)[0]
         x = x + self.mlp(self.mlp_ln(x))
         return x
 
@@ -86,7 +86,7 @@ class AudioEncoder(nn.Module):
         )
         self.ln_post = LayerNormWrapper(n_embed)
 
-    def forward(self, x: Tensor):
+    def encode(self, x: Tensor):
         x = F.gelu(self.conv1(x))
         x = F.gelu(self.conv2(x))
         x = x.permute(0, 2, 1).contiguous()
@@ -99,6 +99,32 @@ class AudioEncoder(nn.Module):
 
         x = self.ln_post(x)
         return x
+
+    def forward(self, x: Tensor):
+        with torch.no_grad():
+            mask = torch.sum(x - x[:, :, [-1]], dim=1, keepdim=True) > 1e-6
+            L = torch.sum(mask, dim=2).max().item()
+            # truncate to L frames
+            x = x[:, :, :L]
+            mask = mask[:, :, :L].float()
+        x = mask * x
+        x = F.gelu(mask * self.conv1(x))  # suppress bias before act_fn
+        # reduce mask using the same setting of conv2
+        mask = F.max_pool1d(mask, kernel_size=3, stride=2, padding=1)
+        x = F.gelu(mask * self.conv2(x))  # suppress bias before act_fn
+        x = x.permute(0, 2, 1).contiguous()
+
+        # assert x.shape[1:] == self.positional_embedding.shape, "incorrect audio shape"
+        x = (x + self.positional_embedding[:x.shape[1]]).to(x.dtype)
+
+        mask = mask.transpose(1, 2).contiguous().to(torch.bool)  # (b, L/2, 1)
+        x = mask * x  # suppress pos_embed
+        for block in self.blocks:
+            x = block(x, mask.squeeze(-1))
+            x = mask * x  # suppress bias
+
+        x = self.ln_post(x)
+        return x, mask.squeeze(-1)
 
     def load_weights_from_whisper(self, state_dict: Dict[str, Tensor]):
         new_state_dict = {}

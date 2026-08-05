@@ -101,11 +101,14 @@ class MultiheadAttention(nn.Module):
         """
 
         b, _, lk, _ = k_proj.size()
-        if key_padding_mask is not None and attn_mask is not None:
+        if key_padding_mask is not None:
             # attn_mask is None for cross-attention layer
             # WARN: attn_mask cannot be None for self-attention layer
-            # key_mask is used during pre-training for self-attention layer
-            attn_mask_expanded = attn_mask.view(1, 1, lk, lk).expand(b, self.n_head, -1, -1)
+            # key_mask is used during pre-training for self-attention and cross-attention layers
+            if attn_mask is None:
+                attn_mask_expanded = torch.zeros((b, self.n_head, q_proj.shape[2], lk), device=q_proj.device, dtype=torch.float32)
+            else:
+                attn_mask_expanded = attn_mask.view(1, 1, lk, lk).expand(b, self.n_head, -1, -1)
             key_mask_expanded = key_padding_mask.view(b, 1, 1, lk).expand(-1, self.n_head, -1, -1)
             attn_mask = attn_mask_expanded + key_mask_expanded
 
@@ -149,16 +152,16 @@ class DecoderBlock(nn.Module):
         query, sa_weights = self.self_attn.attention_forward(q_proj, k_proj, v_proj, attn_mask, key_padding_mask)
         return q + query
 
-    def forward_cross_attn_and_mlp(self, res, q_proj, k_proj, v_proj):
+    def forward_cross_attn_and_mlp(self, res, q_proj, k_proj, v_proj, key_mask=None):
         """
         WARN: res must be unnormalized in order to do residual connection
         """
-        query, ca_weights = self.cross_attn.attention_forward(q_proj, k_proj, v_proj)
+        query, ca_weights = self.cross_attn.attention_forward(q_proj, k_proj, v_proj, key_padding_mask=key_mask)
         res = res + query
         res = res + self.mlp(self.mlp_norm(res))
         return res
 
-    def forward(self, q, ctx, aud, sa_cos_sin, attn_mask, ca_cos_sin, key_padding_mask=None, kv_cache=(None, None)):
+    def forward(self, q, ctx, aud, sa_cos_sin, attn_mask, ca_cos_sin, key_padding_mask=None, ca_key_mask=None, kv_cache=(None, None)):
         """
         regular forward pass
         WARN: q must be unnormalized in order to do residual connection
@@ -168,7 +171,7 @@ class DecoderBlock(nn.Module):
         # NOTE: q is not normalized when passing to self_attn because it is q_projection already, and I only apply rotation.
         query, sa_weights = self.self_attn(q, ctx, ctx, sa_cos_sin, attn_mask, key_padding_mask, kv_cache[0])
         res = q + query
-        query, ca_weights = self.cross_attn(self.ca_norm(res), aud, aud, ca_cos_sin, kv_cache=kv_cache[1])
+        query, ca_weights = self.cross_attn(self.ca_norm(res), aud, aud, ca_cos_sin, key_padding_mask=ca_key_mask, kv_cache=kv_cache[1])
         res = res + query
         res = res + self.mlp(self.mlp_norm(res))
         return res
@@ -270,11 +273,13 @@ class TrorYongASRModel(
         return self.tok_embed(token_ids) * math.sqrt(self.config.n_embed)
 
     def encode(self, mels: Tensor) -> Tensor:
-        return self.encoder(mels)
+        return self.encoder.encode(mels)
 
-    def logits(self, aud_enc: Tensor, tok_embed: Tensor, tok_mask: Optional[Tensor]=None, pred_seq_len: float=0.0, kv_cache=(None, None)):
+    def logits(self, aud_enc: Tensor, tok_embed: Tensor, aud_mask: Optional[Tensor]=None, tok_mask: Optional[Tensor]=None, pred_seq_len: float=0.0, kv_cache=(None, None)):
         """
-        tok_mask: True means do not mask, False means to be masked
+        tok_mask: True means valid token, False means pad token
+        aud_mask: True means valid frame, False means pad frame
+        pred_seq_len: predicted number of tokens for LARoPE
         """
         T0 = 0 if kv_cache[0] is None else kv_cache[0].get_pos()
 
@@ -291,39 +296,52 @@ class TrorYongASRModel(
             ctx = ctx + F.pad(q[:, T0:T1-1], (0, 0, 1, 0, 0, 0))
         elif T0 > 0:  # During inference, from the second token onward
             ctx = ctx + q
-        ctx = self.dropout(ctx)
         ctx = norm(ctx)
+        ctx = self.dropout(ctx)
 
         # T1+1 because Q is one-phase faster than K
         sa_cos_sin = self.cos[:, :, T0+1:T1+1], self.sin[:, :, T0+1:T1+1], self.cos[:, :, T0:T1], self.sin[:, :, T0:T1]
 
-        if pred_seq_len == 0.0:
+        if pred_seq_len == 0.0:  # always True during training
             key_padding_mask = torch.zeros((b, L), device=self.device)
             key_padding_mask.masked_fill_(~tok_mask, -float('inf'))
             actual_seq_len = torch.sum(tok_mask, dim=-1, dtype=torch.float32) # (b, )
+            actual_aud_len = torch.sum(aud_mask, dim=-1, dtype=torch.float32) # (b, )
             seq_len = L
         else:
-            actual_seq_len = None
             key_padding_mask = None
+            actual_seq_len = None
+            actual_aud_len = None
             seq_len = pred_seq_len if T1 < pred_seq_len else T1
 
+        # LARoPE
         q_cos, q_sin = self.compute_cos_sin(seq_len, self.device, actual_seq_len)
-        k_cos, k_sin = self.compute_cos_sin(aud_enc.shape[1], self.device)
+        k_cos, k_sin = self.compute_cos_sin(aud_enc.shape[1], self.device, actual_aud_len)
         ca_cos_sin = q_cos[:, :, T0:T1], q_sin[:, :, T0:T1], k_cos, k_sin
 
-        res = self.decoder(q, ctx, aud_enc, sa_cos_sin, attn_mask, ca_cos_sin, key_padding_mask, kv_cache)
-        return self.lm_head(res)  # (b, L, pad_vocab_size)
-        # return self.lm_head(norm(res))  # (b, L, pad_vocab_size)
+        res = self.decoder(q, ctx, aud_enc, sa_cos_sin, attn_mask, ca_cos_sin, key_padding_mask, aud_mask, kv_cache)
+        return self.lm_head(norm(res))  # (b, L, pad_vocab_size)
 
-    def len_logits(self, aud_enc: Tensor, task_embed: Tensor):
+    def len_logits(self, aud_enc: Tensor, task_embed: Tensor, mask: Optional[Tensor] = None):
         # k_cos, k_sin = self.compute_cos_sin(aud_enc.shape[1], self.device)
         # cos_sin = self.cos[:, :, :1], self.sin[:, :, :1], k_cos, k_sin
         # res = self.ca_len_predictor(aud_enc, task_embed, cos_sin)
         # return self.head_len_predictor(norm(res))
 
-        x = aud_enc.transpose(1, 2)
-        x = F.adaptive_avg_pool1d(F.gelu(self.conv3(x)), 1).squeeze(-1)
-        x = x + task_embed.squeeze(1)
+        x = self.conv3(aud_enc.transpose(1, 2))
+        if mask is not None:  # True during training
+            mask = mask.unsqueeze(1).float()  # (b, 1, lk)
+            # reduce mask using the same setting of conv3
+            mask = F.max_pool1d(mask, kernel_size=5, stride=5)
+            x = mask * x  # suppress bias on padded
+
+            # masked_global_avg_pool1d
+            x = x.sum(dim=-1, keepdim=True)  # (b, n_embed, 1)
+            valid_counts = mask.sum(dim=-1, keepdim=True)  # (b, 1, 1)
+            x = x / (valid_counts + 1e-8)    # (b, n_embed, 1)
+        else:
+            x = F.adaptive_avg_pool1d(F.gelu(x), 1)
+        x = x.squeeze(-1) + task_embed.squeeze(1)
         return self.len_predictor_head(norm(x))
 
     def forward(self, mels, input_ids, target_ids=None):
@@ -335,16 +353,16 @@ class TrorYongASRModel(
         # TODO: rethinking about seq-len prediction as it varies over tasks
 
         # NOTE: in Whisper Audio Encoder, the audio encoding is already normalized by ln_post()
-        aud_enc = self.encoder(mels)
+        aud_enc, aud_mask = self.encoder.forward(mels)
         tok_mask = input_ids != self.config.pad_id
         tok_embed = self.get_token_embedding(input_ids)
         task_embed = tok_embed[:, [2]].detach().clone()
-        logits = self.logits(aud_enc, tok_embed, tok_mask)  # (b, L, pad_vocab_size)
+        logits = self.logits(aud_enc, tok_embed, aud_mask, tok_mask)  # (b, L, pad_vocab_size)
         if target_ids is not None:
             loss = F.cross_entropy(logits.flatten(end_dim=1).float(), target_ids.flatten(), ignore_index=-100, reduction='mean')
 
             # predict sequence length
-            len_logits = self.len_logits(aud_enc.detach(), task_embed)
+            len_logits = self.len_logits(aud_enc.detach(), task_embed, aud_mask)
             target_len = torch.sum(tok_mask, dim=-1, dtype=torch.long)
 
             loss += self.lp_factor * F.cross_entropy(len_logits, target_len, label_smoothing=0.05)
@@ -356,18 +374,18 @@ class TrorYongASRModel(
 
     def compute_cos_sin(
             self,
-            seq_len: int,
+            seq_len: float,
             device: torch.device,
             actual_seq_len: Optional[Tensor] = None
         ) -> tuple[Tensor, Tensor]:
         # seq_len may include pad tokens, actual_seq_len does not
-        pos = torch.arange(seq_len, device=device, dtype=torch.float32)
+        pos = torch.arange(int(seq_len), device=device, dtype=torch.float32)
         if actual_seq_len is None:
-            # cos_sin for key projection, i.e., audio encoding
-            pos = self.gamma * pos / float(seq_len)
+            # cos_sin for a single sequence
+            pos = self.gamma * pos / seq_len
             freqs = torch.outer(pos, self.inv_freq).unsqueeze(0).unsqueeze(0)
         else:
-            # cos_sin for query projection
+            # cos_sin for batched sequences
             pos = (self.gamma * pos).unsqueeze(0) / actual_seq_len.unsqueeze(-1)  # normalize position and rescale
             freqs = torch.einsum('bi,bj->bij', pos, self.inv_freq.unsqueeze(0))  # (b, l, head_dim / 2)
             freqs = freqs.unsqueeze(1)  # expand for head dimension
@@ -387,17 +405,17 @@ class TrorYongASRModel(
         self.prefix = prefix
 
     @torch.inference_mode()
-    def detect_language(self, mels: Tensor, tokenizer, kv_cache):
+    def detect_language(self, mel: Tensor, tokenizer, kv_cache):
         """
         Predicting the language of audio
         NOTE: I could have called `forward` but there is a careful attention required for cos, sin
         """
-        mels = mels.unsqueeze(0)
-        aud_enc = self.encoder(mels)
+        mels = mel.unsqueeze(0)
+        aud_enc, aud_mask = self.encoder.forward(mels)
 
         idx = torch.as_tensor([[tokenizer.sot]], dtype=torch.long, device=self.device)
         tok_embed = self.get_token_embedding(idx)
-        logits = self.logits(aud_enc, tok_embed, pred_seq_len=1.0)
+        logits = self.logits(aud_enc, tok_embed, aud_mask=aud_mask, pred_seq_len=1.0)
 
         # suppress non-language tokens
         mask = torch.ones(logits.shape[-1], dtype=torch.bool)
@@ -416,9 +434,9 @@ class TrorYongASRModel(
         return language_tokens[0], language_probs[0]
 
     @torch.inference_mode()
-    def decode(self, mels: Tensor, max_tokens: int, temperature=1.0, top_k=None, seed=168):
+    def decode(self, mel: Tensor, max_tokens: int, temperature=1.0, top_k=None, seed=168):
         """
-        mels: (n_mels,)
+        mel: (n_mels,)
         max_tokens: int
         """
         if self.prefix is None:
@@ -436,14 +454,14 @@ class TrorYongASRModel(
             rng = torch.Generator(device=device)
             rng.manual_seed(seed)
 
-        mels = mels.unsqueeze(0)
-        aud_enc = self.encoder(mels)
+        mels = mel.unsqueeze(0)
+        aud_enc, aud_mask = self.encoder.forward(mels)
         idx = torch.as_tensor([self.prefix], dtype=torch.long, device=mels.device)
         tok_embed = self.get_token_embedding(idx)
         n = idx.shape[1]
 
         # predict seq_len
-        len_logits = self.len_logits(aud_enc, tok_embed[:, [2]].clone())
+        len_logits = self.len_logits(aud_enc, tok_embed[:, [2]].clone(), aud_mask)
         len_logits[:, :2] = -float('inf') # no sequence has length shorter than 2
         # pred_seq_len = len_logits.argmax(dim=-1).item()
         prob_len = F.softmax(len_logits, dim=-1)
@@ -452,7 +470,7 @@ class TrorYongASRModel(
 
         next_embed = tok_embed
         for i in range(n, max_tokens):
-            logits = self.logits(aud_enc, next_embed, pred_seq_len=pred_seq_len, kv_cache=kv_cache)
+            logits = self.logits(aud_enc, next_embed, aud_mask=aud_mask, pred_seq_len=pred_seq_len, kv_cache=kv_cache)
             logits[:, -1, self.vocab_size:] = -float('inf') # suppress the pad tokens
 
             if temperature > 0:
