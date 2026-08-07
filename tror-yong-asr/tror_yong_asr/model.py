@@ -106,11 +106,10 @@ class MultiheadAttention(nn.Module):
             # WARN: attn_mask cannot be None for self-attention layer
             # key_mask is used during pre-training for self-attention and cross-attention layers
             if attn_mask is None:
-                attn_mask_expanded = torch.zeros((b, self.n_head, q_proj.shape[2], lk), device=q_proj.device, dtype=torch.float32)
+                attn_mask = torch.zeros((b, self.n_head, q_proj.shape[2], lk), device=q_proj.device, dtype=torch.float32)
             else:
-                attn_mask_expanded = attn_mask.view(1, 1, lk, lk).expand(b, self.n_head, -1, -1)
-            key_mask_expanded = key_padding_mask.view(b, 1, 1, lk).expand(-1, self.n_head, -1, -1)
-            attn_mask = attn_mask_expanded + key_mask_expanded
+                attn_mask = attn_mask.view(1, 1, lk, lk).expand(b, self.n_head, -1, -1)
+            attn_mask = attn_mask + key_padding_mask.view(b, 1, 1, lk).expand(-1, self.n_head, -1, -1)
 
         qkv = F.scaled_dot_product_attention(q_proj, k_proj, v_proj, dropout_p=self.dropout.p, attn_mask=attn_mask, is_causal=False)
 
@@ -192,6 +191,49 @@ class CrossAttnLengthPredictor(nn.Module):
         return res
 
 
+class LengthPredictor(nn.Module):
+    def __init__(self, transcribe_id:int, n_embed: int, dropout: float, bias: bool):
+        super().__init__()
+        self.transcribe_id = transcribe_id
+        self.dropout = dropout
+        self.conv3 = Conv1dWrapper(n_embed, n_embed, kernel_size=5, stride=5)
+        self.task_embed = nn.Embedding(4, n_embed) # transcribe, translate, nospeech, neutral
+        # Feature-wise Linear Modulation
+        self.alpha_proj = LinearWrapper(n_embed, n_embed)
+        self.beta_proj = LinearWrapper(n_embed, n_embed)
+        # Output head
+        self.head = LinearWrapper(n_embed, 1, bias=bias)
+
+    def forward(self, aud_enc: Tensor, task_ids: Tensor, aud_mask:Tensor):
+        x = self.conv3(aud_enc.transpose(1, 2))
+        if aud_mask is not None:  # True during training
+            aud_mask = aud_mask.unsqueeze(1).float()  # (b, 1, lk)
+            # reduce mask using the same setting of conv3
+            mask = F.max_pool1d(aud_mask, kernel_size=5, stride=5)
+            x = mask * x  # suppress bias on padded
+
+            # masked_global_avg_pool1d
+            x = x.sum(dim=-1, keepdim=True)  # (b, n_embed, 1)
+            valid_counts = mask.sum(dim=-1, keepdim=True)  # (b, 1, 1)
+            x = x / (valid_counts + 1e-8)    # (b, n_embed, 1)
+        else:
+            x = F.adaptive_avg_pool1d(F.gelu(x), 1)
+
+        task_ids.masked_fill_(task_ids == 2, self.transcribe_id + 2)  # for no_speech case, replace eot_id by no_speech_id
+        task_ids = task_ids - self.transcribe_id  # convert to class: 0 (transcribe) or 1 (translate) or 2 (nospeech)
+        # Apply class-free guidance condition dropout during training
+        if self.training and self.dropout > 0.0:
+            drop_mask = torch.rand(task_ids.shape, device=task_ids.device) < self.dropout
+            task_ids = torch.where(drop_mask, torch.tensor(3, device=task_ids.device), task_ids)
+        task = self.task_embed(task_ids).squeeze(1)
+        # Apply FiLM on the average of audio encoding
+        alpha = self.alpha_proj(task)
+        beta = self.beta_proj(task)
+        x = alpha * x.squeeze(-1) + beta
+        # Output logits
+        return self.head(x).squeeze(-1)
+
+
 @dataclass
 class TrorYongASRConfig:
     vocab_size: int  # use the tokenizer's vocab size
@@ -206,6 +248,7 @@ class TrorYongASRConfig:
     gamma: float = 10.0 # scaling factor for LARoPE
     pad_id: int = 0
     eot_id: int = 2
+    transcribe_id: int = 48002
     tie_word_embeddings: bool = True
 
 
@@ -258,8 +301,12 @@ class TrorYongASRModel(
         # self.ca_len_predictor = CrossAttnLengthPredictor(config.n_embed, self.n_head, mlp_dim, config.dropout, config.bias)
         # self.head_len_predictor = LinearWrapper(config.n_embed, config.n_text_ctx) # seq length predictor specific to LARoPE
 
-        self.conv3 = Conv1dWrapper(config.n_embed, config.n_embed, kernel_size=5, stride=5)
-        self.len_predictor_head = LinearWrapper(config.n_embed, config.n_text_ctx) # sequence length predictor specific to LARoPE
+        self.len_predictor = LengthPredictor(
+            config.transcribe_id,
+            config.n_embed,
+            config.dropout,
+            config.bias
+        )  # sequence length predictor specific to LARoPE
         self.lp_factor = 1.0  # weight of length prediciton loss
 
         mask = torch.empty(config.n_text_ctx, config.n_text_ctx).fill_(-float('inf')).triu_(1)
@@ -322,27 +369,13 @@ class TrorYongASRModel(
         res = self.decoder(q, ctx, aud_enc, sa_cos_sin, attn_mask, ca_cos_sin, key_padding_mask, aud_mask, kv_cache)
         return self.lm_head(norm(res))  # (b, L, pad_vocab_size)
 
-    def len_logits(self, aud_enc: Tensor, task_embed: Tensor, mask: Optional[Tensor] = None):
+    def len_logits(self, aud_enc: Tensor, task_ids: Tensor, aud_mask: Optional[Tensor] = None):
         # k_cos, k_sin = self.compute_cos_sin(aud_enc.shape[1], self.device)
         # cos_sin = self.cos[:, :, :1], self.sin[:, :, :1], k_cos, k_sin
         # res = self.ca_len_predictor(aud_enc, task_embed, cos_sin)
         # return self.head_len_predictor(norm(res))
 
-        x = self.conv3(aud_enc.transpose(1, 2))
-        if mask is not None:  # True during training
-            mask = mask.unsqueeze(1).float()  # (b, 1, lk)
-            # reduce mask using the same setting of conv3
-            mask = F.max_pool1d(mask, kernel_size=5, stride=5)
-            x = mask * x  # suppress bias on padded
-
-            # masked_global_avg_pool1d
-            x = x.sum(dim=-1, keepdim=True)  # (b, n_embed, 1)
-            valid_counts = mask.sum(dim=-1, keepdim=True)  # (b, 1, 1)
-            x = x / (valid_counts + 1e-8)    # (b, n_embed, 1)
-        else:
-            x = F.adaptive_avg_pool1d(F.gelu(x), 1)
-        x = x.squeeze(-1) + task_embed.squeeze(1)
-        return self.len_predictor_head(norm(x))
+        return self.len_predictor(aud_enc, task_ids, aud_mask)
 
     def forward(self, mels, input_ids, target_ids=None):
         """
@@ -356,21 +389,23 @@ class TrorYongASRModel(
         aud_enc, aud_mask = self.encoder.forward(mels)
         tok_mask = input_ids != self.config.pad_id
         tok_embed = self.get_token_embedding(input_ids)
-        task_embed = tok_embed[:, [2]].detach().clone()
         logits = self.logits(aud_enc, tok_embed, aud_mask, tok_mask)  # (b, L, pad_vocab_size)
-        if target_ids is not None:
+        if target_ids is None:
+            # do not compute loss
+            return CausalLMOutput(logits=logits)
+        else:
             loss = F.cross_entropy(logits.flatten(end_dim=1).float(), target_ids.flatten(), ignore_index=-100, reduction='mean')
 
             # predict sequence length
-            len_logits = self.len_logits(aud_enc.detach(), task_embed, aud_mask)
-            target_len = torch.sum(tok_mask, dim=-1, dtype=torch.long)
+            len_logits = self.len_logits(aud_enc.detach(), input_ids[:, [2]], aud_mask)
+            len_pred = torch.tanh(len_logits)
+            # normalize target length to [-1, 1], so that Huber loss has comparable scale to cross_entropy and lp_factor can be set to 1.0
+            norm_tgt_len = torch.sum(tok_mask, dim=-1, dtype=torch.float32)
+            norm_tgt_len = (norm_tgt_len / (0.5 * self.config.n_text_ctx)) - 1
 
-            loss += self.lp_factor * F.cross_entropy(len_logits, target_len, label_smoothing=0.05)
+            loss += self.lp_factor * F.smooth_l1_loss(len_pred, norm_tgt_len, beta=1.0)
 
             return CausalLMOutput(logits=logits, loss=loss)
-        else:
-            # do not compute loss
-            return CausalLMOutput(logits=logits)
 
     def compute_cos_sin(
             self,
@@ -461,12 +496,10 @@ class TrorYongASRModel(
         n = idx.shape[1]
 
         # predict seq_len
-        len_logits = self.len_logits(aud_enc, tok_embed[:, [2]].clone(), aud_mask)
-        len_logits[:, :2] = -float('inf') # no sequence has length shorter than 2
-        # pred_seq_len = len_logits.argmax(dim=-1).item()
-        prob_len = F.softmax(len_logits, dim=-1)
-        indices = torch.arange(len_logits.size(-1), device=self.device, dtype=torch.float32)
-        pred_seq_len = torch.sum(prob_len * indices, dim=-1).item()
+        len_logits = self.len_logits(aud_enc, idx[:, [2]].clone(), aud_mask)
+        len_pred = torch.tanh(len_logits)
+        # normalize target length to [-1, 1], so that Huber loss has comparable scale to cross_entropy and lp_factor can be set to 1.0
+        pred_seq_len = 0.5 * self.config.n_text_ctx * (len_pred + 1)
 
         next_embed = tok_embed
         for i in range(n, max_tokens):
@@ -524,8 +557,13 @@ class TrorYongASRModel(
         # nn.init.uniform_(self.ca_len_predictor.mlp.up_proj.weight, -s * 0.4, s * 0.4)
         # nn.init.zeros_(self.ca_len_predictor.mlp.down_proj.weight)
 
-        nn.init.kaiming_normal_(self.conv3.weight, mode='fan_out', nonlinearity='relu')
-        nn.init.trunc_normal_(self.len_predictor_head.weight, mean=0.0, std=0.02)
+        nn.init.kaiming_normal_(self.len_predictor.conv3.weight, mode='fan_out', nonlinearity='relu')
+        nn.init.normal_(self.len_predictor.task_embed.weight, mean=0.0, std=0.8)
+        nn.init.normal_(self.len_predictor.head.weight, mean=0.0, std=0.001)
+        nn.init.zeros_(self.len_predictor.beta_proj.weight)
+        nn.init.zeros_(self.len_predictor.beta_proj.bias)
+        nn.init.zeros_(self.len_predictor.alpha_proj.weight)
+        nn.init.ones_(self.len_predictor.alpha_proj.bias)
 
         # Embedding
         nn.init.normal_(self.tok_embed.weight, mean=0.0, std=0.001)
