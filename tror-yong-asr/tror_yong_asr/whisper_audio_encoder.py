@@ -101,12 +101,8 @@ class AudioEncoder(nn.Module):
         return x
 
     def forward(self, x: Tensor):
-        with torch.no_grad():
-            mask = torch.sum(x - x[:, :, [-1]], dim=1, keepdim=True) > 1e-6
-            L = torch.sum(mask, dim=2).max().item()
-            # truncate to L frames
-            x = x[:, :, :L]
-            mask = mask[:, :, :L].float()
+        mask = torch.zeros((x.shape[0], 1, x.shape[2]), device=x.device, dtype=torch.float32)
+        mask.mask_fill_(torch.sum(x - x[:, :, [-1]], dim=1, keepdim=True) > 1e-6, 1.0)
         x = mask * x
         x = F.gelu(mask * self.conv1(x))  # suppress bias before act_fn
         # reduce mask using the same setting of conv2
