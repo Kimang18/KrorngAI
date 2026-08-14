@@ -102,25 +102,26 @@ class AudioEncoder(nn.Module):
 
     def forward(self, x: Tensor):
         mask = torch.zeros((x.shape[0], 1, x.shape[2]), device=x.device, dtype=torch.float32)
-        mask.mask_fill_(torch.sum(x - x[:, :, [-1]], dim=1, keepdim=True) > 1e-6, 1.0)
+        mask.masked_fill_(torch.sum(x - x[:, :, [-1]], dim=1, keepdim=True) > 1e-6, 1.0)
         x = mask * x
         x = F.gelu(mask * self.conv1(x))  # suppress bias before act_fn
         # reduce mask using the same setting of conv2
         mask = F.max_pool1d(mask, kernel_size=3, stride=2, padding=1)
         x = F.gelu(mask * self.conv2(x))  # suppress bias before act_fn
-        x = x.permute(0, 2, 1).contiguous()
+        x = x.transpose(1, 2).contiguous()
+        mask = mask.transpose(1, 2).contiguous()  # (b, n_audio_ctx, 1)
 
         # assert x.shape[1:] == self.positional_embedding.shape, "incorrect audio shape"
         x = (x + self.positional_embedding[:x.shape[1]]).to(x.dtype)
 
-        mask = mask.transpose(1, 2).contiguous().to(torch.bool)  # (b, L/2, 1)
         x = mask * x  # suppress pos_embed
+        aud_mask = mask.to(torch.bool).squeeze(-1)
         for block in self.blocks:
-            x = block(x, mask.squeeze(-1))
+            x = block(x, aud_mask)
             x = mask * x  # suppress bias
 
         x = self.ln_post(x)
-        return x, mask.squeeze(-1)
+        return x, aud_mask
 
     def load_weights_from_whisper(self, state_dict: Dict[str, Tensor]):
         new_state_dict = {}
