@@ -82,8 +82,8 @@ class MultiHeadAttention(nn.Module):
 
     def exclude_self_value(self, qkv, v_proj) -> Tensor:
         """
-        For Exclusive Self Attention, project qkv into hyper-plan
-        orthogonal to self-value
+        For Exclusive Self Attention, project qkv into the hyperplane
+        of self-value
         """
         raise NotImplementedError()
 
@@ -91,7 +91,7 @@ class MultiHeadAttention(nn.Module):
         """
         Given the q_proj, k_proj, v_proj projections and attention mask, return the attention output
         NOTE: we separate this function to save time as we use different attention masks
-        for the same query, key, and value
+        for the same query, key, and value and qkv projection requires compute, and time
         """
         qkv = F.scaled_dot_product_attention(q_proj, k_proj, v_proj, dropout_p=self.dropout.p, attn_mask=attn_mask, is_causal=False)
         qkv = self.exclude_self_value(qkv, v_proj)
@@ -130,8 +130,6 @@ class SelfMultiHeadAttention(MultiHeadAttention):
         Project qkv to subspace that is orthogonal to v_proj
         to perform exclusive self-attention
         """
-
-        # perform 'exclusive self-attention'
         if qkv.shape == v_proj.shape:
             vn = F.normalize(v_proj, dim=-1, eps=1e-9)
         else:  # when decoding, qkv=(b, n_head, 1, n_embed) != v_proj=(b, n_head, lk, n_embed)
@@ -141,8 +139,7 @@ class SelfMultiHeadAttention(MultiHeadAttention):
     def attention_forward(self, q_proj: Tensor, k_proj: Tensor, v_proj: Tensor, attn_mask: Optional[Tensor] = None, key_mask: Optional[Tensor] = None) -> Tensor:
         """
         """
-        if key_mask is not None:
-            # key_mask is used during pre-training
+        if key_mask is not None:  # always True during pre-training
             attn_mask = attn_mask.unsqueeze(0).unsqueeze(0) + key_mask
         return super().attention_forward(q_proj, k_proj, v_proj, attn_mask)
 
@@ -182,7 +179,8 @@ class CrossMultiHeadAttention(MultiHeadAttention):
                 k_proj, v_proj = self.kv_projection(content, k_cos, k_sin)
                 kv_cache['key'] = k_proj
                 kv_cache['value'] = v_proj
-            v_proj = kv_cache['value']
+            else:
+                v_proj = kv_cache['value']
         return q_proj, k_proj, v_proj
 
     def exclude_self_value(self, qkv: Tensor, v_proj: Tensor) -> Tensor:
@@ -251,13 +249,13 @@ class DecoderBlock(nn.Module):
         """
         regular forward pass
         WARN: q must be unnormalized in order to do residual connection
-        NOTE: try LARoPE implementation - apply length-aware RoPE on q_proj and k_proj
-        right before attention forward
+        NOTE: try LARoPE implementation in cross attention - apply
+        length-aware RoPE on q_proj and k_proj right before attention forward
         """
         # NOTE: q is not normalized when passing to self_attn because it is q_projection already, and I only apply rotation.
         query = self.self_attn(q, ctx, sa_cos_sin, attn_mask, tok_mask, kv_cache[0])
         res = q + query
-        query = self.cross_attn(self.ca_norm(res), aud, ca_cos_sin, aud_mask, kv_cache=kv_cache[1])
+        query = self.cross_attn(self.ca_norm(res), aud, ca_cos_sin, aud_mask, kv_cache[1])
         res = res + query
         res = res + self.mlp(self.mlp_norm(res))
         return res
@@ -272,13 +270,14 @@ class LengthPredictor(nn.Module):
         self.conv3 = Conv1dWrapper(n_embed, n_embed, kernel_size=5, stride=5)
         self.task_embed = nn.Embedding(4, n_embed) # transcribe, translate, nospeech, neutral
         # Feature-wise Linear Modulation
-        self.alpha_proj = LinearWrapper(n_embed, n_embed)
-        self.beta_proj = LinearWrapper(n_embed, n_embed)
+        self.alpha_proj = LinearWrapper(n_embed, n_embed, bias=False)
+        self.beta_proj = LinearWrapper(n_embed, n_embed, bias=True)
         # Output head
         self.head = LinearWrapper(n_embed, 1, bias=bias)
 
     def forward(self, aud_enc: Tensor, task_ids: Tensor, aud_mask:Tensor) -> Tensor:
-        x = self.conv3(aud_enc.transpose(1, 2))
+        x = aud_enc.transpose(1, 2).contiguous()    # (b, n_embed, lk)
+        x = self.conv3(x)
         if aud_mask is not None:  # True during training
             aud_mask = aud_mask.unsqueeze(1).float()  # (b, 1, lk)
             # reduce mask using the same setting of conv3
@@ -288,7 +287,7 @@ class LengthPredictor(nn.Module):
             # masked_global_avg_pool1d
             x = x.sum(dim=-1, keepdim=True)  # (b, n_embed, 1)
             valid_counts = mask.sum(dim=-1, keepdim=True)  # (b, 1, 1)
-            x = x / (valid_counts + 1e-8)    # (b, n_embed, 1)
+            x = x / (valid_counts + 1e-9)    # (b, n_embed, 1)
         else:
             x = F.adaptive_avg_pool1d(F.gelu(x), 1)
 
@@ -304,7 +303,7 @@ class LengthPredictor(nn.Module):
         beta = self.beta_proj(task)
         x = alpha * x.squeeze(-1) + beta
         # Output logits
-        return self.head(x).squeeze(-1)
+        return torch.tanh(self.head(x).squeeze(-1))
 
 
 @dataclass
@@ -318,7 +317,7 @@ class TrorYongASRConfig:
     n_layer: int
     dropout: float = 0.0
     bias: bool = True
-    gamma: float = 10.0  # scaling factor for LARoPE
+    gamma: float = 100.0  # scaling factor for LARoPE
     pad_id: int = 0
     eot_id: int = 2
     transcribe_id: int = 48002
@@ -410,7 +409,7 @@ class TrorYongASRModel(
         # decoding layer
         b, L, _ = tok_embed.size()
         T1 = T0 + L
-        assert T1 <= self.config.n_text_ctx, "input_ids is too long"
+        # assert T1 <= self.config.n_text_ctx, "input_ids is too long"
 
         attn_mask = None
         q = self.pos_basis.expand(b, L, -1)
@@ -420,8 +419,8 @@ class TrorYongASRModel(
             ctx = ctx + F.pad(q[:, T0:T1-1], (0, 0, 1, 0, 0, 0))
         elif T0 > 0:  # During inference, from the second token onward
             ctx = ctx + q
-        ctx = norm(ctx)
         ctx = self.dropout(ctx)
+        ctx = norm(ctx)
 
         # T1+1 because Q is one-phase faster than K
         sa_cos_sin = self.cos[:, :, T0+1:T1+1], self.sin[:, :, T0+1:T1+1], self.cos[:, :, T0:T1], self.sin[:, :, T0:T1]
@@ -448,12 +447,6 @@ class TrorYongASRModel(
         res = self.decoder(q, ctx, aud_enc, sa_cos_sin, attn_mask, ca_cos_sin, tok_mask, aud_mask, kv_cache)
         return self.lm_head(norm(res))  # (b, L, pad_vocab_size)
 
-    def len_logits(self, aud_enc: Tensor, task_ids: Tensor, aud_mask: Optional[Tensor] = None) -> Tensor:
-        """
-        length logits are bounded on [-1, 1]
-        """
-        return torch.tanh(self.len_predictor(aud_enc, task_ids, aud_mask))
-
     def forward(self, mels: Tensor, input_ids: Tensor, target_ids: Optional[Tensor] = None) -> CausalLMOutput:
         """
         mels: log-mel spectrum from audio array
@@ -471,11 +464,12 @@ class TrorYongASRModel(
             return CausalLMOutput(logits=logits)
         else:
             # predict sequence length
-            len_logits = self.len_logits(aud_enc.detach(), input_ids[:, [2]], aud_mask)
+            # len_logits is bounded on [-1, 1] via tanh
+            len_logits = self.len_predictor(aud_enc.detach(), input_ids[:, [2]], aud_mask)
             # normalize target length to [-1, 1], so that Huber loss has comparable scale to cross_entropy and lp_factor can be set to 1.0
             norm_tgt_len = torch.sum(tok_mask, dim=-1, dtype=torch.float32)
             norm_tgt_len = (norm_tgt_len / (0.5 * self.config.n_text_ctx)) - 1
-            loss = F.smooth_l1_loss(len_logits, norm_tgt_len, beta=1.0)
+            loss = F.smooth_l1_loss(len_logits.float(), norm_tgt_len.float(), beta=1.0)
 
             logits = self.logits(aud_enc, tok_embed, aud_mask, tok_mask)  # (b, L, pad_vocab_size)
             loss += F.cross_entropy(logits.flatten(end_dim=1).float(), target_ids.flatten(), ignore_index=-100, reduction='mean')
@@ -571,7 +565,7 @@ class TrorYongASRModel(
         n = idx.shape[1]
 
         # predict seq_len
-        len_logits = self.len_logits(aud_enc, idx[:, [2]].clone(), aud_mask)
+        len_logits = self.len_predictor(aud_enc, idx[:, [2]].clone(), aud_mask)
         pred_seq_len = 0.5 * self.config.n_text_ctx * (len_logits + 1)
 
         next_embed = tok_embed
@@ -627,7 +621,7 @@ class TrorYongASRModel(
         nn.init.zeros_(self.len_predictor.beta_proj.weight)
         nn.init.zeros_(self.len_predictor.beta_proj.bias)
         nn.init.zeros_(self.len_predictor.alpha_proj.weight)
-        nn.init.ones_(self.len_predictor.alpha_proj.bias)
+        # nn.init.ones_(self.len_predictor.alpha_proj.bias)
 
         # Embedding
         nn.init.normal_(self.tok_embed.weight, mean=0.0, std=0.001)
