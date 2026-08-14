@@ -262,20 +262,22 @@ class DecoderBlock(nn.Module):
 
 
 class LengthPredictor(nn.Module):
-    def __init__(self, transcribe_id:int, n_embed: int, dropout: float, bias: bool):
+    def __init__(self, n_text_ctx: int, transcribe_id:int, n_embed: int, dropout: float, bias: bool):
         super().__init__()
+        self.half_text_ctx = 0.5 * n_text_ctx
         self.transcribe_id = transcribe_id
         self.nospeech_id = transcribe_id + 2  # this is due to my tokenizer design
         self.dropout = dropout
         self.conv3 = Conv1dWrapper(n_embed, n_embed, kernel_size=5, stride=5)
-        self.task_embed = nn.Embedding(4, n_embed) # transcribe, translate, nospeech, neutral
+        # self.task_embed = nn.Embedding(4, n_embed)  # transcribe, translate, nospeech, neutral
+        self.task_embed = nn.Embedding(3, n_embed)  # transcribe, translate, nospeech
         # Feature-wise Linear Modulation
         self.alpha_proj = LinearWrapper(n_embed, n_embed, bias=False)
-        self.beta_proj = LinearWrapper(n_embed, n_embed, bias=True)
+        self.beta_proj = LinearWrapper(n_embed, n_embed, bias=False)
         # Output head
         self.head = LinearWrapper(n_embed, 1, bias=bias)
 
-    def forward(self, aud_enc: Tensor, task_ids: Tensor, aud_mask:Tensor) -> Tensor:
+    def forward(self, aud_enc: Tensor, task_ids: Tensor, aud_mask: Optional[Tensor] = None) -> Tensor:
         x = aud_enc.transpose(1, 2).contiguous()    # (b, n_embed, lk)
         x = self.conv3(x)
         if aud_mask is not None:  # True during training
@@ -289,21 +291,24 @@ class LengthPredictor(nn.Module):
             valid_counts = mask.sum(dim=-1, keepdim=True)  # (b, 1, 1)
             x = x / (valid_counts + 1e-9)    # (b, n_embed, 1)
         else:
-            x = F.adaptive_avg_pool1d(F.gelu(x), 1)
+            # x = F.adaptive_avg_pool1d(F.gelu(x), 1)
+            x = F.adaptive_avg_pool1d(x, 1)
 
         task_ids.masked_fill_(task_ids == 2, self.nospeech_id)  # for no_speech case, replace eot_id by nospeech_id
         task_ids = task_ids - self.transcribe_id  # convert to class: 0 (transcribe) or 1 (translate) or 2 (nospeech)
         # Apply class-free guidance condition dropout during training
-        if self.training and self.dropout > 0.0:
-            drop_mask = torch.rand(task_ids.shape, device=task_ids.device) < self.dropout
-            task_ids = torch.where(drop_mask, torch.tensor(3, device=task_ids.device), task_ids)
+        # if self.training and self.dropout > 0.0:
+        #     drop_mask = torch.rand(task_ids.shape, device=task_ids.device) < self.dropout
+        #     task_ids = torch.where(drop_mask, torch.tensor(3, device=task_ids.device), task_ids)
         task = self.task_embed(task_ids).squeeze(1)
         # Apply FiLM on the average of audio encoding
         alpha = self.alpha_proj(task)
         beta = self.beta_proj(task)
         x = alpha * x.squeeze(-1) + beta
         # Output logits
-        return torch.tanh(self.head(x).squeeze(-1))
+        logits = self.head(x).squeeze(-1)
+        # use softcap and shift output to [0, 2*half_text_ctx]
+        return self.half_text_ctx * torch.tanh(logits / self.half_text_ctx) + self.half_text_ctx
 
 
 @dataclass
@@ -317,7 +322,7 @@ class TrorYongASRConfig:
     n_layer: int
     dropout: float = 0.0
     bias: bool = True
-    gamma: float = 100.0  # scaling factor for LARoPE
+    gamma: float = 10.0  # scaling factor for LARoPE
     pad_id: int = 0
     eot_id: int = 2
     transcribe_id: int = 48002
@@ -371,6 +376,7 @@ class TrorYongASRModel(
 
         # Sequence Length Predictor, used for LARoPE's inference
         self.len_predictor = LengthPredictor(
+            config.n_text_ctx,
             config.transcribe_id,
             config.n_embed,
             config.dropout,
@@ -464,12 +470,10 @@ class TrorYongASRModel(
             return CausalLMOutput(logits=logits)
         else:
             # predict sequence length
-            # len_logits is bounded on [-1, 1] via tanh
-            len_logits = self.len_predictor(aud_enc.detach(), input_ids[:, [2]], aud_mask)
-            # normalize target length to [-1, 1], so that Huber loss has comparable scale to cross_entropy and lp_factor can be set to 1.0
-            norm_tgt_len = torch.sum(tok_mask, dim=-1, dtype=torch.float32)
-            norm_tgt_len = (norm_tgt_len / (0.5 * self.config.n_text_ctx)) - 1
-            loss = F.smooth_l1_loss(len_logits.float(), norm_tgt_len.float(), beta=1.0)
+            # pred_len is bounded on [0, n_text_ctx] via softcap and shift
+            pred_len = self.len_predictor(aud_enc.detach(), input_ids[:, [2]], aud_mask)
+            target_len = torch.sum(tok_mask, dim=-1, dtype=torch.float32)
+            loss = F.smooth_l1_loss(pred_len.float(), target_len, beta=1.0)
 
             logits = self.logits(aud_enc, tok_embed, aud_mask, tok_mask)  # (b, L, pad_vocab_size)
             loss += F.cross_entropy(logits.flatten(end_dim=1).float(), target_ids.flatten(), ignore_index=-100, reduction='mean')
@@ -616,12 +620,14 @@ class TrorYongASRModel(
         nn.init.zeros_(self.decoder.mlp.down_proj.weight)
 
         nn.init.kaiming_normal_(self.len_predictor.conv3.weight, mode='fan_out', nonlinearity='relu')
-        nn.init.normal_(self.len_predictor.task_embed.weight, mean=0.0, std=0.8)
+        nn.init.trunc_normal_(self.len_predictor.task_embed.weight, std=1.0)
         nn.init.normal_(self.len_predictor.head.weight, mean=0.0, std=0.001)
         nn.init.zeros_(self.len_predictor.beta_proj.weight)
-        nn.init.zeros_(self.len_predictor.beta_proj.bias)
+        if self.len_predictor.beta_proj.bias is not None:
+            nn.init.zeros_(self.len_predictor.beta_proj.bias)
         nn.init.zeros_(self.len_predictor.alpha_proj.weight)
-        # nn.init.ones_(self.len_predictor.alpha_proj.bias)
+        if self.len_predictor.alpha_proj.bias is not None:
+            nn.init.ones_(self.len_predictor.alpha_proj.bias)
 
         # Embedding
         nn.init.normal_(self.tok_embed.weight, mean=0.0, std=0.001)
