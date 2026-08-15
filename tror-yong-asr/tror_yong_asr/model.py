@@ -267,9 +267,7 @@ class LengthPredictor(nn.Module):
         self.half_text_ctx = 0.5 * n_text_ctx
         self.transcribe_id = transcribe_id
         self.nospeech_id = transcribe_id + 2  # this is due to my tokenizer design
-        self.dropout = dropout
         self.conv3 = Conv1dWrapper(n_embed, n_embed, kernel_size=5, stride=5)
-        # self.task_embed = nn.Embedding(4, n_embed)  # transcribe, translate, nospeech, neutral
         self.task_embed = nn.Embedding(3, n_embed)  # transcribe, translate, nospeech
         # Feature-wise Linear Modulation
         self.alpha_proj = LinearWrapper(n_embed, n_embed, bias=False)
@@ -291,15 +289,10 @@ class LengthPredictor(nn.Module):
             valid_counts = mask.sum(dim=-1, keepdim=True)  # (b, 1, 1)
             x = x / (valid_counts + 1e-9)    # (b, n_embed, 1)
         else:
-            # x = F.adaptive_avg_pool1d(F.gelu(x), 1)
             x = F.adaptive_avg_pool1d(x, 1)
 
         task_ids.masked_fill_(task_ids == 2, self.nospeech_id)  # for no_speech case, replace eot_id by nospeech_id
         task_ids = task_ids - self.transcribe_id  # convert to class: 0 (transcribe) or 1 (translate) or 2 (nospeech)
-        # Apply class-free guidance condition dropout during training
-        # if self.training and self.dropout > 0.0:
-        #     drop_mask = torch.rand(task_ids.shape, device=task_ids.device) < self.dropout
-        #     task_ids = torch.where(drop_mask, torch.tensor(3, device=task_ids.device), task_ids)
         task = self.task_embed(task_ids).squeeze(1)
         # Apply FiLM on the average of audio encoding
         alpha = self.alpha_proj(task)
@@ -402,8 +395,8 @@ class TrorYongASRModel(
             tok_embed: Tensor,
             aud_mask: Optional[Tensor] = None,
             tok_mask: Optional[Tensor] = None,
-            pred_seq_len: Optional[float]=0.0,
-            kv_cache: Optional[tuple[Optional[KVCache], Optional[dict]]]=(None, None)
+            pred_seq_len: Optional[float] = 0.0,
+            kv_cache: Optional[tuple[Optional[KVCache], Optional[dict]]] = (None, None)
             ) -> Tensor:
         """
         tok_mask: True means valid token, False means pad token
@@ -516,14 +509,13 @@ class TrorYongASRModel(
     def detect_language(self, mel: Tensor, tokenizer, kv_cache):
         """
         Predicting the language of audio
-        NOTE: I could have called `forward` but there is a careful attention required for cos, sin
         """
         mels = mel.unsqueeze(0)
-        aud_enc, aud_mask = self.encoder.forward(mels)
+        aud_enc = self.encoder.encode(mels)
 
         idx = torch.as_tensor([[tokenizer.sot]], dtype=torch.long, device=self.device)
         tok_embed = self.get_token_embedding(idx)
-        logits = self.logits(aud_enc, tok_embed, aud_mask=aud_mask, pred_seq_len=1.0)
+        logits = self.logits(aud_enc, tok_embed, pred_seq_len=1.0)
 
         # suppress non-language tokens
         mask = torch.ones(logits.shape[-1], dtype=torch.bool)
@@ -563,18 +555,17 @@ class TrorYongASRModel(
             rng.manual_seed(seed)
 
         mels = mel.unsqueeze(0)
-        aud_enc, aud_mask = self.encoder.forward(mels)
+        aud_enc = self.encoder.encode(mels)
         idx = torch.as_tensor([self.prefix], dtype=torch.long, device=mels.device)
         tok_embed = self.get_token_embedding(idx)
         n = idx.shape[1]
 
         # predict seq_len
-        len_logits = self.len_predictor(aud_enc, idx[:, [2]].clone(), aud_mask)
-        pred_seq_len = 0.5 * self.config.n_text_ctx * (len_logits + 1)
+        pred_seq_len = self.len_predictor(aud_enc, idx[:, [2]].clone())
 
         next_embed = tok_embed
         for i in range(n, max_tokens):
-            logits = self.logits(aud_enc, next_embed, aud_mask=aud_mask, pred_seq_len=pred_seq_len, kv_cache=kv_cache)
+            logits = self.logits(aud_enc, next_embed, pred_seq_len=pred_seq_len, kv_cache=kv_cache)
             logits[:, -1, self.vocab_size:] = -float('inf')     # suppress the pad tokens
 
             if temperature > 0:
