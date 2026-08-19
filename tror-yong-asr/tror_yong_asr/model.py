@@ -279,9 +279,9 @@ class LengthPredictor(nn.Module):
         super().__init__()
         self.half_text_ctx = 0.5 * n_text_ctx
         self.transcribe_id = transcribe_id
-        self.nospeech_id = transcribe_id + 2  # this is due to my tokenizer design
+        self.no_speech_id = transcribe_id + 2  # this is due to my tokenizer design
         self.conv3 = Conv1dWrapper(n_embed, n_embed, kernel_size=5, stride=5)
-        self.task_embed = nn.Embedding(3, n_embed)  # transcribe, translate, nospeech
+        self.task_embed = nn.Embedding(3, n_embed)  # transcribe, translate, no_speech
         self.dropout = nn.Dropout(dropout)
         # Feature-wise Linear Modulation
         self.alpha_proj = LinearWrapper(n_embed, n_embed, bias=False)
@@ -305,9 +305,9 @@ class LengthPredictor(nn.Module):
         else:
             x = F.adaptive_avg_pool1d(F.gelu(x), 1)
 
-        task_ids.masked_fill_(task_ids == 2, self.nospeech_id)  # for no_speech case, replace eot_id by nospeech_id
-        task_ids = task_ids - self.transcribe_id  # convert to class: 0 (transcribe) or 1 (translate) or 2 (nospeech)
-        task = self.dropout(self.task_embed(task_ids).squeeze(1))
+        task_ids.masked_fill_(task_ids == 2, self.no_speech_id)  # for no_speech case, replace eot_id by no_speech_id
+        task_ids = task_ids - self.transcribe_id  # convert to class: 0 (transcribe) or 1 (translate) or 2 (no_speech)
+        task = self.dropout(self.task_embed(task_ids).squeeze(1))  # (b, n_embed)
         # Apply FiLM on the average of audio encoding
         alpha = self.alpha_proj(task)
         beta = self.beta_proj(task)
@@ -406,7 +406,7 @@ class TrorYongASRModel(
             print_banner()
 
     def get_token_embedding(self, token_ids: Tensor) -> Tensor:
-        return self.tok_embed(token_ids) # * math.sqrt(self.config.n_embed)
+        return self.tok_embed(token_ids)
 
     def encode(self, mels: Tensor) -> Tensor:
         return self.encoder.encode(mels)
@@ -526,7 +526,7 @@ class TrorYongASRModel(
         self.prefix = prefix
 
     @torch.inference_mode()
-    def detect_language(self, mel: Tensor, tokenizer, kv_cache):
+    def detect_language(self, mel: Tensor, tokenizer):
         """
         Predicting the language of audio
         """
@@ -601,7 +601,7 @@ class TrorYongASRModel(
             if id_next.item() == self.config.eot_id:
                 break
             next_embed = self.get_token_embedding(id_next)
-        return idx
+        return idx[0]
 
     @torch.no_grad()
     def init_weights(self):

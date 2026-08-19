@@ -15,15 +15,15 @@ def detect_language(file_name: str, model: TrorYongASRModel, processor):
     """
     # load audio directly to a tensor
     waveform, sample_rate = torchaudio.load(file_name)
-    # resample if necessary (my model excepts 16kHz)
+    # resample if necessary (my model accepts 16kHz)
     if sample_rate != 16000:
         resampler = torchaudio.transforms.Resample(sample_rate, 16000)
         waveform = resampler(waveform)
     audio_array = waveform.squeeze().numpy()  # 1D-array
 
-    mels = processor(audio_array, sampling_rate=16000, return_tensors="pt").input_features[0]  # (80, 3000)
+    mel = processor(audio_array, sampling_rate=16000, return_tensors="pt").input_features[0]  # (80, 3000)
 
-    return model.detect_language(mels, processor.tokenizer)
+    return model.detect_language(mel, processor.tokenizer)
 
 
 def _task_handling(file_name: str, model: TrorYongASRModel, processor, task: str, max_tokens: int, temperature=1.0, top_k=None, seed=168, verbose=False) -> TaskOutput:
@@ -46,21 +46,24 @@ def _task_handling(file_name: str, model: TrorYongASRModel, processor, task: str
         waveform = resampler(waveform)
     audio_array = waveform.squeeze().numpy()  # 1D-array
 
-    mels = processor(audio_array, sampling_rate=16000, return_tensors="pt").input_features[0]  # (80, 3000)
+    mel = processor(audio_array, sampling_rate=16000, return_tensors="pt").input_features[0]  # (80, 3000)
 
     if processor.tokenizer.language is None:
-        lang_token_id, lang_probs = model.detect_language(mels, processor.tokenizer)
+        lang_token_id, lang_probs = model.detect_language(mel, processor.tokenizer)
         if verbose:
             print("Language Prediction", lang_probs)
         lang_token_id = lang_token_id.item()
     else:
         lang_token_id = processor.tokenizer.language_token
 
+    if lang_token_id == processor.tokenizer.no_speech:
+        return TaskOutput(text='', output_ids=[processor.tokenizer.sot, lang_token_id, processor.tokenizer.eot])
+
     model.set_prefix([processor.tokenizer.sot, lang_token_id, task_token_id])
 
-    output_ids = model.decode(mels, max_tokens, temperature, top_k, seed)
-    text = processor.decode(output_ids[0], skip_special_tokens=True)
-    return TaskOutput(text=text, output_ids=output_ids[0])
+    output_ids = model.decode(mel, max_tokens, temperature, top_k, seed)
+    text = processor.decode(output_ids, skip_special_tokens=True)
+    return TaskOutput(text=text, output_ids=output_ids)
 
 
 transcribe = partial(_task_handling, task='transcribe')
