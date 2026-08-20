@@ -290,7 +290,15 @@ class LengthPredictor(nn.Module):
         self.head = LinearWrapper(n_embed, 1, bias=bias)
 
     def forward(self, aud_enc: Tensor, task_ids: Tensor, aud_mask: Optional[Tensor] = None) -> Tensor:
+        task_ids.masked_fill_(task_ids == 2, self.no_speech_id)  # for no_speech case, replace eot_id by no_speech_id
+        task_ids = task_ids - self.transcribe_id  # convert to class: 0 (transcribe) or 1 (translate) or 2 (no_speech)
+        task = self.dropout(self.task_embed(task_ids).squeeze(1))  # (b, n_embed)
+        # Apply FiLM on the average of audio encoding
+        alpha = self.alpha_proj(task)
+        beta = self.beta_proj(task)
         x = aud_enc.transpose(1, 2).contiguous()    # (b, n_embed, lk)
+        x = alpha.unsqueeze(-1) * x + beta.unsqueeze(-1)
+
         x = self.conv3(x)
         if aud_mask is not None:  # True during training
             aud_mask = aud_mask.unsqueeze(1).float()  # (b, 1, lk)
@@ -303,17 +311,14 @@ class LengthPredictor(nn.Module):
             valid_counts = mask.sum(dim=-1, keepdim=True)  # (b, 1, 1)
             x = x / (valid_counts + 1e-9)    # (b, n_embed, 1)
         else:
-            x = F.adaptive_avg_pool1d(F.gelu(x), 1)
+            x = F.adaptive_avg_pool1d(F.gelu(x), 1)  # (b, n_embed, 1)
 
-        task_ids.masked_fill_(task_ids == 2, self.no_speech_id)  # for no_speech case, replace eot_id by no_speech_id
-        task_ids = task_ids - self.transcribe_id  # convert to class: 0 (transcribe) or 1 (translate) or 2 (no_speech)
-        task = self.dropout(self.task_embed(task_ids).squeeze(1))  # (b, n_embed)
-        # Apply FiLM on the average of audio encoding
-        alpha = self.alpha_proj(task)
-        beta = self.beta_proj(task)
-        x = alpha * x.squeeze(-1) + beta
+        # # Apply FiLM on the average of audio encoding
+        # x = alpha * x.squeeze(-1) + beta
         # Output logits
-        logits = self.head(x).squeeze(-1)
+        # logits = self.head(x).squeeze(-1)
+
+        logits = self.head(x.squeeze(-1)).squeeze(-1)
         # use softcap and shift output to [0, 2*half_text_ctx]
         return self.half_text_ctx * torch.tanh(logits / self.half_text_ctx) + self.half_text_ctx
 
@@ -424,6 +429,7 @@ class TrorYongASRModel(
         tok_mask: True means valid token, False means pad token
         aud_mask: True means valid frame, False means pad frame
         pred_seq_len: predicted number of tokens for LARoPE
+        NOTE: when pred_seq_len != 0, ignore tok_mask, aud_mask
         """
         T0 = 0 if kv_cache[0] is None else kv_cache[0].get_pos()
 
@@ -452,7 +458,7 @@ class TrorYongASRModel(
             aud_mask = torch.where(aud_mask, 0.0, -float('inf'))
             aud_mask = aud_mask.view(b, 1, 1, -1).expand(-1, self.n_head, L, -1)
             seq_len = L
-        else:
+        else:  # not training, ignore tok_mask, and aud_mask
             actual_seq_len = None
             actual_aud_len = None
             seq_len = pred_seq_len if T1 < pred_seq_len else T1
@@ -581,7 +587,7 @@ class TrorYongASRModel(
         n = idx.shape[1]
 
         # predict seq_len
-        pred_seq_len = self.len_predictor(aud_enc, idx[:, [2]].clone())
+        pred_seq_len = self.len_predictor(aud_enc, idx[:, [2]])
 
         next_embed = tok_embed
         for i in range(n, max_tokens):
