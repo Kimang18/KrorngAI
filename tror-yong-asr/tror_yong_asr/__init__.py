@@ -1,3 +1,4 @@
+from torch import Tensor
 from collections import namedtuple
 from functools import partial
 import torchaudio
@@ -6,6 +7,19 @@ from ._version import __version__
 
 
 TaskOutput = namedtuple("TaskOutput", "output_ids text")
+# hard-coded audio hyperparameters
+SAMPLE_RATE = 16_000
+
+
+def load_mel_from_file(file_name: str, processor) -> Tensor:
+    # load audio directly to a tensor
+    waveform, sample_rate = torchaudio.load(file_name)
+    # resample if necessary (my model accepts 16kHz)
+    if sample_rate != SAMPLE_RATE:
+        resampler = torchaudio.transforms.Resample(sample_rate, SAMPLE_RATE)
+        waveform = resampler(waveform)
+    waveform = waveform.squeeze()  # 1D-array
+    return processor(waveform, sampling_rate=SAMPLE_RATE, return_tensors="pt", padding="longest").input_features[0]  # (80, n_frames)
 
 
 def detect_language(file_name: str, model: TrorYongASRModel, processor):
@@ -13,16 +27,8 @@ def detect_language(file_name: str, model: TrorYongASRModel, processor):
     Args:
     file_name: file path to audio (tested with mp3, but m4a or wav are not tested yet)
     """
-    # load audio directly to a tensor
-    waveform, sample_rate = torchaudio.load(file_name)
-    # resample if necessary (my model accepts 16kHz)
-    if sample_rate != 16000:
-        resampler = torchaudio.transforms.Resample(sample_rate, 16000)
-        waveform = resampler(waveform)
-    audio_array = waveform.squeeze().numpy()  # 1D-array
 
-    mel = processor(audio_array, sampling_rate=16000, return_tensors="pt").input_features[0]  # (80, 3000)
-
+    mel = load_mel_from_file(file_name, processor)
     return model.detect_language(mel, processor.tokenizer)
 
 
@@ -38,15 +44,7 @@ def _task_handling(file_name: str, model: TrorYongASRModel, processor, task: str
     if task_token_id is None:
         raise ValueError(f"No support for task {task}. Either 'transcribe' or 'translate' is supported.")
 
-    # load audio directly to a tensor
-    waveform, sample_rate = torchaudio.load(file_name)
-    # resample if necessary (my model excepts 16kHz)
-    if sample_rate != 16000:
-        resampler = torchaudio.transforms.Resample(sample_rate, 16000)
-        waveform = resampler(waveform)
-    audio_array = waveform.squeeze().numpy()  # 1D-array
-
-    mel = processor(audio_array, sampling_rate=16000, return_tensors="pt").input_features[0]  # (80, 3000)
+    mel = load_mel_from_file(file_name, processor)
 
     if processor.tokenizer.language is None:
         lang_token_id, lang_probs = model.detect_language(mel, processor.tokenizer)
