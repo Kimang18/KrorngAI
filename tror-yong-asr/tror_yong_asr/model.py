@@ -532,7 +532,7 @@ class TrorYongASRModel(
         self.prefix = prefix
 
     @torch.inference_mode()
-    def detect_language(self, mel: Tensor, tokenizer):
+    def identify_language(self, mel: Tensor, tokenizer):
         """
         Predicting the language of audio
         """

@@ -28,14 +28,14 @@ def load_mel_spectrogram(audio: Union[str, np.ndarray], processor) -> Tensor:
     return processor(waveform, sampling_rate=SAMPLE_RATE, return_tensors="pt", padding="longest").input_features[0]  # (80, n_frames)
 
 
-def detect_language(audio: Union[str, np.ndarray], model: TrorYongASRModel, processor):
+def identify_language(audio: Union[str, np.ndarray], model: TrorYongASRModel, processor):
     """
     Args:
         audio: file path to audio (tested with mp3, but m4a or wav are not tested yet) or audio array
     """
 
     mel = load_mel_spectrogram(audio, processor)
-    return model.detect_language(mel, processor.tokenizer)
+    return model.identify_language(mel, processor.tokenizer)
 
 
 def _task_handling(audio: Union[str, np.ndarray], model: TrorYongASRModel, processor, task: str, max_tokens: int, temperature=1.0, top_k=None, seed=168, verbose=False) -> TaskOutput:
@@ -48,7 +48,7 @@ def _task_handling(audio: Union[str, np.ndarray], model: TrorYongASRModel, proce
     """
 
     if processor.tokenizer.language is None:
-        raise ValueError(f"Please set language attribute of processor.tokenizer. Call detect_language for language identification.")
+        raise ValueError(f"Please set language attribute of processor.tokenizer. Call identify_language for language identification.")
 
     lang_token_id = processor.tokenizer.language_token
 
