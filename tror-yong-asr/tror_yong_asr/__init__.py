@@ -1,63 +1,64 @@
+from typing import Union
+import torch
 from torch import Tensor
 from collections import namedtuple
 from functools import partial
-import torchaudio
+import numpy as np
 from .model import TrorYongASRModel, TrorYongASRConfig
 from ._version import __version__
 
 
 TaskOutput = namedtuple("TaskOutput", "output_ids text")
 # hard-coded audio hyperparameters
-SAMPLE_RATE = 16_000
 
 
-def load_mel_from_file(file_name: str, processor) -> Tensor:
-    # load audio directly to a tensor
-    waveform, sample_rate = torchaudio.load(file_name)
-    # resample if necessary (my model accepts 16kHz)
-    if sample_rate != SAMPLE_RATE:
-        resampler = torchaudio.transforms.Resample(sample_rate, SAMPLE_RATE)
-        waveform = resampler(waveform)
-    waveform = waveform.squeeze()  # 1D-array
+def load_mel_spectrogram(audio: Union[str, np.ndarray], processor) -> Tensor:
+    import torchaudio
+    SAMPLE_RATE = 16_000  # TrorYongASR is trained with this rate
+    if isinstance(audio, str):  # file_name
+        # load audio directly to a tensor
+        waveform, sample_rate = torchaudio.load(audio)
+        # resample if necessary (my model accepts 16kHz)
+        if sample_rate != SAMPLE_RATE:
+            resampler = torchaudio.transforms.Resample(sample_rate, SAMPLE_RATE)
+            waveform = resampler(waveform)
+        waveform = waveform.squeeze()  # 1D-array
+    elif isinstance(audio, np.ndarray):
+        waveform = torch.tensor(audio)
     return processor(waveform, sampling_rate=SAMPLE_RATE, return_tensors="pt", padding="longest").input_features[0]  # (80, n_frames)
 
 
-def detect_language(file_name: str, model: TrorYongASRModel, processor):
+def detect_language(audio: Union[str, np.ndarray], model: TrorYongASRModel, processor):
     """
     Args:
-    file_name: file path to audio (tested with mp3, but m4a or wav are not tested yet)
+        audio: file path to audio (tested with mp3, but m4a or wav are not tested yet) or audio array
     """
 
-    mel = load_mel_from_file(file_name, processor)
+    mel = load_mel_spectrogram(audio, processor)
     return model.detect_language(mel, processor.tokenizer)
 
 
-def _task_handling(file_name: str, model: TrorYongASRModel, processor, task: str, max_tokens: int, temperature=1.0, top_k=None, seed=168, verbose=False) -> TaskOutput:
+def _task_handling(audio: Union[str, np.ndarray], model: TrorYongASRModel, processor, task: str, max_tokens: int, temperature=1.0, top_k=None, seed=168, verbose=False) -> TaskOutput:
     """
     Args:
-    file_name: file path to audio (tested with mp3, but m4a or wav are not tested yet)
-    max_tokens: maximum number of tokens to be generated
-    temperature: calibrate randomness (e.g., 0.0 means greedy decoding)
-    verbose: if true and processor.language is None, then print the predicted language
+        audio: file path to audio (tested with mp3, but m4a or wav are not tested yet) or audio array
+        max_tokens: maximum number of tokens to be generated
+        temperature: calibrate randomness (e.g., 0.0 means greedy decoding)
+        verbose: if true and processor.language is None, then print the predicted language
     """
-    task_token_id = getattr(processor.tokenizer, task, None)
-    if task_token_id is None:
-        raise ValueError(f"No support for task {task}. Either 'transcribe' or 'translate' is supported.")
-
-    mel = load_mel_from_file(file_name, processor)
 
     if processor.tokenizer.language is None:
-        lang_token_id, lang_probs = model.detect_language(mel, processor.tokenizer)
-        if verbose:
-            print("Language Prediction", lang_probs)
-        lang_token_id = lang_token_id.item()
-    else:
-        lang_token_id = processor.tokenizer.language_token
+        raise ValueError(f"Please set language attribute of processor.tokenizer. Call detect_language for language identification.")
 
-    if lang_token_id == processor.tokenizer.no_speech:
-        return TaskOutput(text='', output_ids=[processor.tokenizer.sot, lang_token_id, processor.tokenizer.eot])
+    lang_token_id = processor.tokenizer.language_token
+
+    task_token_id = getattr(processor.tokenizer, task, None)
+    if task_token_id is None:
+        raise ValueError(f"Not supported for task {task}. Either 'transcribe' or 'translate' is supported.")
 
     model.set_prefix([processor.tokenizer.sot, lang_token_id, task_token_id])
+
+    mel = load_mel_spectrogram(audio, processor)
 
     output_ids = model.decode(mel, max_tokens, temperature, top_k, seed)
     text = processor.decode(output_ids, skip_special_tokens=True)
