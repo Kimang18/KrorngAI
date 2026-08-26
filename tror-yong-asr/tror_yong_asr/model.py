@@ -2,13 +2,15 @@
 # Date: March 2026
 """
 Features:
-- exclusive self-attention
 - text decoder with a single transformer block
-- RoPE in text decoder
+- gated multi-head attention
+- exclusive self-attention
+- p-RoPE in self-attention
+- p-LARoPE in cross-attention
 - Dynamic Error Function instead of normalization layer in text decoder
-- SiLU gate in MLP of transformer
 - QK-normalization with Derf before SDP
-- LARoPE for Cross-Attention
+- SiLU gate in MLP of transformer
+- during inference, accepts audio array of arbitrary length <= 30 * 16_000
 """
 
 
@@ -45,6 +47,7 @@ class MultiHeadAttention(nn.Module):
         self.n_head = n_head
         self.head_dim = n_embed // n_head
         self.dropout = nn.Dropout(dropout)
+        self.g_proj = LinearWrapper(n_embed, n_head, bias=bias)
         self.k_proj = LinearWrapper(n_embed, n_embed, bias=False)
         self.v_proj = LinearWrapper(n_embed, n_embed, bias=bias)
         self.out_proj = LinearWrapper(n_embed, n_embed, bias=bias)
@@ -59,6 +62,11 @@ class MultiHeadAttention(nn.Module):
         q = q.view(*q.shape[:2], self.n_head, self.head_dim).transpose(1, 2)
         q = self.q_norm(q)
         q = apply_rotary_emb(q, cos, sin)
+
+        # generate gating score
+        g = self.g_proj(query)  # (b, lq, n_head)
+        g = g.transpose(1, 2).unsqueeze(-1)  # (b, n_head, lq, 1)
+        q = torch.cat([q, g], dim=-1)  # (b, n_head, lq, head_dim + 1)
         return q
 
     def kv_projection(self, content: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
@@ -94,8 +102,13 @@ class MultiHeadAttention(nn.Module):
         NOTE: we separate this function to save time as we use different attention masks
         for the same query, key, and value and qkv projection requires compute, and time
         """
+        q_proj, g_score = torch.split(q_proj, [self.head_dim, 1], dim=-1)
+        q_proj = q_proj.contiguous()
         qkv = F.scaled_dot_product_attention(q_proj, k_proj, v_proj, dropout_p=self.dropout.p, attn_mask=attn_mask, is_causal=False)
         qkv = self.exclude_self_value(qkv, v_proj)
+
+        # apply gate score
+        qkv = qkv * torch.sigmoid(g_score)
 
         qkv = qkv.transpose(1, 2).flatten(start_dim=2)      # (b, lq, n_embed)
         out = self.out_proj(qkv)
@@ -121,7 +134,7 @@ class SelfMultiHeadAttention(MultiHeadAttention):
         """
         # apply RoPE
         q_cos, q_sin, k_cos, k_sin = cos_sin
-        q_proj = self.q_projection(query, q_cos, q_sin)
+        q_proj = self.q_projection(query, q_cos, q_sin)  # (b, n_head, lq, head_dim)
         k_proj, v_proj = self.kv_projection(content, k_cos, k_sin)
         if kv_cache is not None:
             k_proj, v_proj = kv_cache.insert_kv(0, k_proj, v_proj)  # there is only one layer, so layer_idx=0
@@ -134,7 +147,7 @@ class SelfMultiHeadAttention(MultiHeadAttention):
         """
         if qkv.shape == v_proj.shape:
             vn = F.normalize(v_proj, dim=-1, eps=1e-9)
-        else:  # when decoding, qkv=(b, n_head, 1, n_embed) != v_proj=(b, n_head, lk, n_embed)
+        else:  # when decoding, qkv=(b, n_head, 1, n_embed) != v_proj=(b, n_head, lk, head_dim)
             vn = F.normalize(v_proj[:, :, [-1], :], dim=-1, eps=1e-9)
         return qkv - torch.sum(qkv * vn, dim=-1, keepdim=True) * vn
 
@@ -293,13 +306,14 @@ class LengthPredictor(nn.Module):
         task_ids.masked_fill_(task_ids == 2, self.no_speech_id)  # for no_speech case, replace eot_id by no_speech_id
         task_ids = task_ids - self.transcribe_id  # convert to class: 0 (transcribe) or 1 (translate) or 2 (no_speech)
         task = self.dropout(self.task_embed(task_ids).squeeze(1))  # (b, n_embed)
-        # Apply FiLM on the average of audio encoding
-        alpha = self.alpha_proj(task)
-        beta = self.beta_proj(task)
+        # Apply FiLM on the audio encoding
+        alpha = self.alpha_proj(task).unsqueeze(-1)
+        beta = self.beta_proj(task).unsqueeze(-1)
         x = aud_enc.transpose(1, 2).contiguous()    # (b, n_embed, lk)
-        x = alpha.unsqueeze(-1) * x + beta.unsqueeze(-1)
+        # x = alpha * x + beta
 
         x = self.conv3(x)
+        x = alpha * x + beta
         if aud_mask is not None:  # True during training
             aud_mask = aud_mask.unsqueeze(1).float()  # (b, 1, lk)
             # reduce mask using the same setting of conv3
@@ -314,10 +328,9 @@ class LengthPredictor(nn.Module):
             x = F.adaptive_avg_pool1d(F.gelu(x), 1)  # (b, n_embed, 1)
 
         # # Apply FiLM on the average of audio encoding
-        # x = alpha * x.squeeze(-1) + beta
-        # Output logits
-        # logits = self.head(x).squeeze(-1)
+        # x = alpha * x + beta
 
+        # Output logits
         logits = self.head(x.squeeze(-1)).squeeze(-1)
         # use softcap and shift output to [0, 2*half_text_ctx]
         return self.half_text_ctx * torch.tanh(logits / self.half_text_ctx) + self.half_text_ctx
@@ -380,14 +393,13 @@ class TrorYongASRModel(
             self.lm_head.weight = self.tok_embed.weight
 
         # LARoPE
-        # self.gamma = config.gamma  # LaRoPE gamma rescaling factor
         base = 1e4  # base frequency default to 1e4
         rope_angles = int(config.rope_percentage * self.head_dim // 2)
         # Generate frequencies for the number of pairs we are actually rotating
+        # 'NoPE' part gets '0.0', so sin(0)=0, cos(0)=1
         # NOTE: gamma is included here to save computation in compute_cos_sin
         # i.e., instead of gamma * pos * inv_freq, we do pos * gamma_inv_freq (outer product)
         gamma_inv_freq = torch.zeros(self.head_dim // 2, dtype=torch.float32)
-        # 'NoPE' part gets '0.0', so sin(0)=0, cos(0)=1
         gamma_inv_freq[:rope_angles] = config.gamma / (
             base ** (torch.arange(0, 2 * rope_angles, 2, dtype=torch.float32) / self.head_dim)
         )
@@ -560,10 +572,11 @@ class TrorYongASRModel(
         return language_tokens[0], language_probs[0]
 
     @torch.inference_mode()
-    def decode(self, mel: Tensor, max_tokens: int, temperature=1.0, top_k=None, seed=168):
+    def decode(self, mel: Tensor, max_tokens: int, temperature=1.0, top_k=None, seed=168) -> Tensor:
         """
         mel: (n_mels,)
         max_tokens: int
+        return: list of token ids
         """
         if self.prefix is None:
             raise SyntaxError("Please provide bos, language, and task tokens as prefix using set_prefix before calling decode.")
@@ -623,11 +636,13 @@ class TrorYongASRModel(
             nn.init.uniform_(block.mlp[0].weight, -s * 0.4, s * 0.4)
             nn.init.zeros_(block.mlp[2].weight)
 
+        nn.init.uniform_(self.decoder.self_attn.g_proj.weight, -s, s)
         nn.init.uniform_(self.decoder.self_attn.k_proj.weight, -s, s)
         nn.init.uniform_(self.decoder.self_attn.v_proj.weight, -s, s)
         nn.init.zeros_(self.decoder.self_attn.out_proj.weight)
 
         nn.init.uniform_(self.decoder.cross_attn.q_proj.weight, -s, s)
+        nn.init.uniform_(self.decoder.cross_attn.g_proj.weight, -s, s)
         nn.init.uniform_(self.decoder.cross_attn.k_proj.weight, -s, s)
         nn.init.uniform_(self.decoder.cross_attn.v_proj.weight, -s, s)
         nn.init.zeros_(self.decoder.cross_attn.out_proj.weight)
@@ -661,8 +676,8 @@ class TrorYongASRModel(
         base = 1e4  # base frequency default to 1e4
         rope_angles = int(self.config.rope_percentage * self.head_dim // 2)
         # Generate frequencies for the number of pairs we are actually rotating
-        self.gamma_inv_freq = torch.zeros(self.head_dim // 2, dtype=torch.float32)
         # 'NoPE' part gets '0.0', so sin(0)=0, cos(0)=1
+        self.gamma_inv_freq = torch.zeros(self.head_dim // 2, dtype=torch.float32)
         self.gamma_inv_freq[:rope_angles] = self.config.gamma / (
             base ** (torch.arange(0, 2 * rope_angles, 2, dtype=torch.float32) / self.head_dim)
         )
