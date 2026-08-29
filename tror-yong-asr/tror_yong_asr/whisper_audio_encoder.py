@@ -84,7 +84,6 @@ class AudioEncoder(nn.Module):
         self.blocks: Iterable[ResidualAttentionBlock] = nn.ModuleList(
             [ResidualAttentionBlock(n_embed, n_head) for _ in range(n_layer)]
         )
-        self.ln_post = LayerNormWrapper(n_embed)
 
     def encode(self, x: Tensor):
         x = F.gelu(self.conv1(x))
@@ -97,7 +96,6 @@ class AudioEncoder(nn.Module):
         for block in self.blocks:
             x = block(x)
 
-        x = self.ln_post(x)
         return x
 
     def forward(self, x: Tensor):
@@ -120,13 +118,14 @@ class AudioEncoder(nn.Module):
             x = block(x, aud_mask)
             x = mask * x  # suppress bias
 
-        x = self.ln_post(x)
         return x, aud_mask
 
     def load_weights_from_whisper(self, state_dict: Dict[str, Tensor]):
         new_state_dict = {}
         for old_layer, tensor in state_dict.items():
             if "positional_embedding" in old_layer:
+                continue
+            elif "ln_post" in old_layer:
                 continue
             new_state_dict[old_layer] = tensor
         self.load_state_dict(new_state_dict, strict=False)
