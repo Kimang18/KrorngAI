@@ -6,20 +6,23 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 from torch import nn, Tensor
+import functools
 
 
-def precompute_rotary_emb(seq_len, head_dim, device, base=10000, rope_percentage=1.0):
+def precompute_rotary_emb(seq_len, head_dim, device, base=10000, rope_percentage=1.0, dtype=torch.float32):
     rope_angles = int(rope_percentage * head_dim // 2)
     nope_angles = head_dim // 2 - rope_angles
 
     # Generate frequencies for the number of pairs we are actually rotating
     channel_range = torch.arange(0, 2 * rope_angles, 2, dtype=torch.float32, device=device)
+    inv_freq = 1.0 / (base ** (channel_range / head_dim))
     # 'NoPE' part gets '0.0', so sin(0)=0, cos(0)=1
-    inv_freq = F.pad(1.0 / (base ** (channel_range / head_dim)), (0, nope_angles), mode='constant', value=0.0)
+    inv_freq = F.pad(inv_freq, (0, nope_angles), mode='constant', value=0.0)
     t = torch.arange(seq_len, dtype=torch.float32, device=device)
     freqs = torch.outer(t, inv_freq)
     cos, sin = freqs.cos(), freqs.sin()
-    cos, sin = cos.bfloat16(), sin.bfloat16()
+    cos, sin = cos.to(dtype), sin.to(dtype)
+    # cos, sin = cos.bfloat16(), sin.bfloat16()
     # cos, sin = cos.half(), sin.half()  # stored in float16 for 16-mixed
     return cos[None, None, :, :], sin[None, None, :, :]
 
@@ -66,6 +69,13 @@ class Conv1dWrapper(nn.Conv1d):
         )
 
 
+def upcast_then_downcast(forward_fn):
+    @functools.wraps(forward_fn)
+    def wrapper(self, x, *args, **kwargs):
+        return forward_fn(self, x.float()).type(x.dtype)
+    return wrapper
+
+
 class Dynamic_erf(nn.Module):
     """
     Taken from https://github.com/zlab-princeton/Derf/blob/main/speech%20model/dynamic_erf.patch
@@ -82,6 +92,7 @@ class Dynamic_erf(nn.Module):
         self.weight = nn.Parameter(torch.ones(normalized_shape))
         self.bias = nn.Parameter(torch.zeros(normalized_shape))
 
+    @upcast_then_downcast
     def forward(self, x: Tensor) -> Tensor:
         x = torch.erf(self.alpha * x + self.shift)
         x = x * self.weight + self.bias
@@ -91,9 +102,24 @@ class Dynamic_erf(nn.Module):
         return f"normalized_shape={self.normalized_shape}, alpha_init_value={self.alpha_init_value}, shift_init_value={self.shift_init_value}"
 
 
-class DerfWrapper(Dynamic_erf):
-    def forward(self, x: Tensor) -> Tensor:
-        return super().forward(x.float()).type(x.dtype)
+# Copied from transformers.models.llama.modeling_llama.LlamaRMSNorm with Llama->Qwen3
+class Qwen3RMSNorm(nn.Module):
+    def __init__(self, hidden_size, eps=1e-6):
+        """
+        Qwen3RMSNorm is equivalent to T5LayerNorm
+        """
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    @upcast_then_downcast
+    def forward(self, x):
+        variance = x.pow(2).mean(-1, keepdim=True)
+        x = x * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * x
+
+    def extra_repr(self):
+        return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
 
 class Conv1D(nn.Module):
