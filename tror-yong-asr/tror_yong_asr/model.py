@@ -24,8 +24,8 @@ from transformers.modeling_outputs import CausalLMOutput
 from huggingface_hub import PyTorchModelHubMixin
 from .nn_utils import (
     precompute_rotary_emb,
-    DerfWrapper,
-    norm,
+    Dynamic_erf,
+    Qwen3RMSNorm,
     apply_rotary_emb,
     MLP,
     LinearWrapper,
@@ -51,8 +51,8 @@ class MultiHeadAttention(nn.Module):
         self.k_proj = LinearWrapper(n_embed, n_embed, bias=False)
         self.v_proj = LinearWrapper(n_embed, n_embed, bias=bias)
         self.out_proj = LinearWrapper(n_embed, n_embed, bias=bias)
-        self.q_norm = DerfWrapper(self.head_dim)
-        self.k_norm = DerfWrapper(self.head_dim)
+        self.q_norm = Dynamic_erf(self.head_dim)
+        self.k_norm = Dynamic_erf(self.head_dim)
 
     def q_projection(self, query: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
         """
@@ -236,11 +236,13 @@ class CrossMultiHeadAttention(MultiHeadAttention):
 class DecoderBlock(nn.Module):
     def __init__(self, d_model, nhead, dim_feedforward, dropout, bias) -> None:
         super().__init__()
+        self.sa_k_norm = Dynamic_erf(d_model)
         self.self_attn = SelfMultiHeadAttention(d_model, nhead, dropout, bias)
+        self.ca_q_norm = Dynamic_erf(d_model)
+        self.ca_k_norm = Dynamic_erf(d_model)
         self.cross_attn = CrossMultiHeadAttention(d_model, nhead, dropout, bias)
-        self.ca_norm = DerfWrapper(d_model)
+        self.mlp_norm = Dynamic_erf(d_model)
         self.mlp = MLP(d_model, dim_feedforward, dropout, bias)
-        self.mlp_norm = DerfWrapper(d_model)
 
     def forward_self_attn(self, q: Tensor, q_proj: Tensor, k_proj: Tensor, v_proj: Tensor, attn_mask: Tensor, tok_mask: Optional[Tensor] = None) -> Tensor:
         """
@@ -279,9 +281,9 @@ class DecoderBlock(nn.Module):
         length-aware RoPE on q_proj and k_proj right before attention forward
         """
         # NOTE: q is not normalized when passing to self_attn cuz it is used as q_proj, and I only apply rotation.
-        query = self.self_attn(q, ctx, sa_cos_sin, attn_mask, tok_mask, kv_cache[0])
+        query = self.self_attn(q, self.sa_k_norm(ctx), sa_cos_sin, attn_mask, tok_mask, kv_cache[0])
         res = q + query
-        query = self.cross_attn(self.ca_norm(res), aud, ca_cos_sin, aud_mask, kv_cache[1])
+        query = self.cross_attn(self.ca_q_norm(res), self.ca_k_norm(aud), ca_cos_sin, aud_mask, kv_cache[1])
         res = res + query
         res = res + self.mlp(self.mlp_norm(res))
         return res
@@ -386,6 +388,7 @@ class TrorYongASRModel(
         self.vocab_size = config.vocab_size
         self.pad_vocab_size = (config.vocab_size + 31) // 32 * 32
         self.tok_embed = nn.Embedding(self.pad_vocab_size, config.n_embed, padding_idx=self.config.pad_id)
+        self.lm_norm = Qwen3RMSNorm(config.n_embed)
         self.lm_head = LinearWrapper(config.n_embed, self.pad_vocab_size, bias=False)
 
         # weight tying
@@ -401,7 +404,7 @@ class TrorYongASRModel(
         # i.e., instead of gamma * pos * inv_freq, we do pos * gamma_inv_freq (outer product)
         gamma_inv_freq = torch.zeros(self.head_dim // 2, dtype=torch.float32)
         gamma_inv_freq[:rope_angles] = config.gamma / (
-            base ** (torch.arange(0, 2 * rope_angles, 2, dtype=torch.float32) / self.head_dim)
+            base ** (torch.arange(0, 2 * rope_angles, 2, dtype=torch.float32, device=self.device) / self.head_dim)
         )
 
         self.register_buffer("gamma_inv_freq", gamma_inv_freq, persistent=False)
@@ -452,7 +455,6 @@ class TrorYongASRModel(
 
         q = self.pos_basis.expand(b, L, -1)
         ctx = self.dropout(tok_embed)
-        ctx = norm(ctx)
 
         attn_mask = None
         if L > 1:  # always True during training. During inference, True for the initial tokens
@@ -462,8 +464,8 @@ class TrorYongASRModel(
         sa_cos_sin = self.cos[:, :, T0+1:T1+1], self.sin[:, :, T0+1:T1+1], self.cos[:, :, T0:T1], self.sin[:, :, T0:T1]
 
         if pred_seq_len == 0.0:  # always True during training
-            actual_seq_len = torch.sum(tok_mask, dim=-1, dtype=torch.float32) # (b, )
-            actual_aud_len = torch.sum(aud_mask, dim=-1, dtype=torch.float32) # (b, )
+            actual_seq_len = torch.sum(tok_mask, dim=-1, dtype=torch.float32)  # (b, )
+            actual_aud_len = torch.sum(aud_mask, dim=-1, dtype=torch.float32)  # (b, )
             # convert boolean masks to float masks
             tok_mask = torch.where(tok_mask, 0.0, -float('inf'))
             tok_mask = tok_mask.view(b, 1, 1, -1).expand(-1, self.n_head, L, -1)
@@ -476,12 +478,12 @@ class TrorYongASRModel(
             seq_len = pred_seq_len if T1 < pred_seq_len else T1
 
         # LARoPE
-        q_cos, q_sin = self.compute_cos_sin(seq_len, self.device, actual_seq_len)
-        k_cos, k_sin = self.compute_cos_sin(aud_enc.shape[1], self.device, actual_aud_len)
+        q_cos, q_sin = self.compute_cos_sin(seq_len, self.device, actual_seq_len, q.dtype)
+        k_cos, k_sin = self.compute_cos_sin(aud_enc.shape[1], self.device, actual_aud_len, q.dtype)
         ca_cos_sin = q_cos[:, :, T0:T1], q_sin[:, :, T0:T1], k_cos, k_sin
 
         res = self.decoder(q, ctx, aud_enc, sa_cos_sin, attn_mask, ca_cos_sin, tok_mask, aud_mask, kv_cache)
-        return self.lm_head(norm(res))  # (b, L, pad_vocab_size)
+        return self.lm_head(self.lm_norm(res))  # (b, L, pad_vocab_size)
 
     def forward(self, mels: Tensor, input_ids: Tensor, target_ids: Optional[Tensor] = None) -> CausalLMOutput:
         """
@@ -514,7 +516,8 @@ class TrorYongASRModel(
             self,
             seq_len: float,
             device: torch.device,
-            actual_seq_len: Optional[Tensor] = None
+            actual_seq_len: Optional[Tensor] = None,
+            dtype = torch.float32
         ) -> tuple[Tensor, Tensor]:
         # Different from RoPE by normalize pos with the seq_len
         # seq_len may include pad tokens, actual_seq_len does not
@@ -522,15 +525,15 @@ class TrorYongASRModel(
         if actual_seq_len is None:
             # cos_sin for a single sequence
             pos = pos / seq_len
-            freqs = torch.outer(pos, self.gamma_inv_freq).unsqueeze(0).unsqueeze(0)
+            freqs = torch.outer(pos.float(), self.gamma_inv_freq.float()).unsqueeze(0).unsqueeze(0)
         else:
             # cos_sin for batched sequences
             pos = pos.unsqueeze(0) / actual_seq_len.unsqueeze(-1)  # normalize position and rescale
-            freqs = torch.einsum('bi,bj->bij', pos, self.gamma_inv_freq.unsqueeze(0))  # (b, l, head_dim / 2)
+            freqs = torch.einsum('bi,bj->bij', pos.float(), self.gamma_inv_freq.unsqueeze(0).float())  # (b, l, head_dim / 2)
             freqs = freqs.unsqueeze(1)  # expand for head dimension
 
         cos, sin = freqs.cos(), freqs.sin()
-        return cos.bfloat16(), sin.bfloat16()
+        return cos.to(dtype), sin.to(dtype)
 
     @property
     def device(self):
@@ -670,8 +673,7 @@ class TrorYongASRModel(
         nn.init.trunc_normal_(self.pos_basis, std=1.0)
 
         # Rotary embeddings
-        cos, sin = precompute_rotary_emb(self.config.n_text_ctx, self.head_dim, device=self.device, rope_percentage=self.config.rope_percentage)
-        self.cos, self.sin = cos, sin
+        self.cos, self.sin = precompute_rotary_emb(self.config.n_text_ctx, self.head_dim, device=self.device, rope_percentage=self.config.rope_percentage)
 
         base = 1e4  # base frequency default to 1e4
         rope_angles = int(self.config.rope_percentage * self.head_dim // 2)
