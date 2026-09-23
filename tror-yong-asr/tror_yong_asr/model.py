@@ -8,7 +8,7 @@ Features:
 - p-RoPE in self-attention
 - p-LARoPE in cross-attention
 - Dynamic Error Function instead of normalization layer in text decoder
-- QK-normalization with Derf before SDP
+- head-specific QK-normalization with Derf before SDP
 - SiLU gate in MLP of transformer
 - during inference, accepts audio array of arbitrary length <= 30 * 16_000
 """
@@ -24,8 +24,8 @@ from transformers.modeling_outputs import CausalLMOutput
 from huggingface_hub import PyTorchModelHubMixin
 from .nn_utils import (
     precompute_rotary_emb,
-    Dynamic_erf,
     Qwen3RMSNorm,
+    Dynamic_erf,
     apply_rotary_emb,
     MLP,
     LinearWrapper,
@@ -38,6 +38,7 @@ from .whisper_audio_encoder import AudioEncoder
 
 class MultiHeadAttention(nn.Module):
     """
+    MultiHeadAttention with Gated mechanism of Qwen3
     Base class of SelfAttention and CrossAttention
     Common methods are implemented here.
     """
@@ -45,40 +46,51 @@ class MultiHeadAttention(nn.Module):
     def __init__(self, n_embed, n_head, dropout=0.0, bias=True):
         super().__init__()
         self.n_head = n_head
-        self.head_dim = n_embed // n_head
         self.dropout = nn.Dropout(dropout)
-        self.g_proj = LinearWrapper(n_embed, n_head, bias=bias)
-        self.k_proj = LinearWrapper(n_embed, n_embed, bias=False)
-        self.v_proj = LinearWrapper(n_embed, n_embed, bias=bias)
+        self.gate = LinearWrapper(n_embed, n_head, bias=bias)
+        self.kv_proj = LinearWrapper(n_embed, 2 * n_embed, bias=bias)
         self.out_proj = LinearWrapper(n_embed, n_embed, bias=bias)
-        self.q_norm = Dynamic_erf(self.head_dim)
-        self.k_norm = Dynamic_erf(self.head_dim)
+        self.q_norm = Dynamic_erf(n_embed)
+        self.k_norm = Dynamic_erf(n_embed)
 
-    def q_projection(self, query: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+    def q_projection(self, query: Tensor, cos: Tensor, sin: Tensor) -> tuple[Tensor, Tensor]:
         """
         Compute and return the projection of query
+        NOTE: it returns a tuple of tensor, query projection, and gate score
         """
-        q = self.q_proj(query)
-        q = q.view(*q.shape[:2], self.n_head, self.head_dim).transpose(1, 2)
-        q = self.q_norm(q)
+        q = (
+            self.q_norm(self.q_proj(query))
+            .view(*query.shape[:2], self.n_head, -1)
+            .transpose(1, 2)
+        )
         q = apply_rotary_emb(q, cos, sin)
 
         # generate gating score
-        g = self.g_proj(query)  # (b, lq, n_head)
-        g = g.transpose(1, 2).unsqueeze(-1)  # (b, n_head, lq, 1)
-        q = torch.cat([q, g], dim=-1)  # (b, n_head, lq, head_dim + 1)
-        return q
+        g_score = (
+            self.gate(query)  # (b, lq, n_head)
+            .transpose(1, 2)
+            .unsqueeze(-1)  # (b, n_head, lq, 1)
+        )
+        return (q, g_score)
 
     def kv_projection(self, content: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
         """
-        Compute and return the projection of key and value
+        Compute and return the projections for key and value
         """
-        k = self.k_proj(content)
-        k = k.view(*k.shape[:2], self.n_head, self.head_dim).transpose(1, 2)
-        k = self.k_norm(k)
+        # k, v = (
+        #     self.kv_proj(content)
+        #     .view(*content.shape[:2], 2, self.n_head, -1)
+        #     .permute(2, 0, 3, 1, 4)
+        #     .unbind(0)
+        # )
+        k, v = self.kv_proj(content).chunk(2, dim=-1)
+        k = (
+            self.k_norm(k)
+            .view(*k.shape[:2], self.n_head, -1)
+            .transpose(1, 2)
+        )
         k = apply_rotary_emb(k, cos, sin)
-        v = self.v_proj(content)
-        v = v.view(*v.shape[:2], self.n_head, self.head_dim).transpose(1, 2)
+        v = v.view(*v.shape[:2], self.n_head, -1).transpose(1, 2)
         return k, v
 
     def qkv_projection(self, query, content, cos_sin, kv_cache=None) -> tuple[Tensor, Tensor, Tensor]:
@@ -96,19 +108,18 @@ class MultiHeadAttention(nn.Module):
         """
         raise NotImplementedError()
 
-    def attention_forward(self, q_proj: Tensor, k_proj: Tensor, v_proj: Tensor, attn_mask: Optional[Tensor] = None) -> Tensor:
+    def attention_forward(self, q_proj: tuple[Tensor, Tensor], k_proj: Tensor, v_proj: Tensor, attn_mask: Optional[Tensor] = None) -> Tensor:
         """
         Given the q_proj, k_proj, v_proj projections and attention mask, return the attention output
         NOTE: we separate this function to save time as we use different attention masks
-        for the same query, key, and value and qkv projection requires compute, and time
+        for the same query, key, and value, and qkv projection requires compute and time
+        NOTE: q_proj is a tuple of tensors, query projection and gate projection
         """
-        q_proj, g_score = torch.split(q_proj, [self.head_dim, 1], dim=-1)
-        q_proj = q_proj.contiguous()
-        qkv = F.scaled_dot_product_attention(q_proj, k_proj, v_proj, dropout_p=self.dropout.p, attn_mask=attn_mask, is_causal=False)
+        qkv = F.scaled_dot_product_attention(q_proj[0], k_proj, v_proj, dropout_p=self.dropout.p, attn_mask=attn_mask, is_causal=False)
         qkv = self.exclude_self_value(qkv, v_proj)
 
         # apply gate score
-        qkv = qkv * torch.sigmoid(g_score)
+        qkv = qkv * torch.sigmoid(q_proj[1])
 
         qkv = qkv.transpose(1, 2).flatten(start_dim=2)      # (b, lq, n_embed)
         out = self.out_proj(qkv)
@@ -134,7 +145,7 @@ class SelfMultiHeadAttention(MultiHeadAttention):
         """
         # apply RoPE
         q_cos, q_sin, k_cos, k_sin = cos_sin
-        q_proj = self.q_projection(query, q_cos, q_sin)  # (b, n_head, lq, head_dim)
+        q_proj = self.q_projection(query, q_cos, q_sin)  # tuple[(b, n_head, lq, head_dim), (b, n_head, lq, 1)]
         k_proj, v_proj = self.kv_projection(content, k_cos, k_sin)
         if kv_cache is not None:
             k_proj, v_proj = kv_cache.insert_kv(0, k_proj, v_proj)  # there is only one layer, so layer_idx=0
@@ -146,14 +157,14 @@ class SelfMultiHeadAttention(MultiHeadAttention):
         to perform exclusive self-attention
         """
         if qkv.shape == v_proj.shape:
-            vn = F.normalize(v_proj, dim=-1, eps=1e-9)
+            vn = F.normalize(v_proj, dim=-1, eps=1e-6)
         else:  # when decoding, qkv=(b, n_head, 1, n_embed) != v_proj=(b, n_head, lk, head_dim)
-            vn = F.normalize(v_proj[:, :, [-1], :], dim=-1, eps=1e-9)
+            vn = F.normalize(v_proj[:, :, [-1], :], dim=-1, eps=1e-6)
         return qkv - torch.sum(qkv * vn, dim=-1, keepdim=True) * vn
 
     def attention_forward(self, q_proj: Tensor, k_proj: Tensor, v_proj: Tensor, attn_mask: Optional[Tensor] = None, key_mask: Optional[Tensor] = None) -> Tensor:
         """
-        If key_mask is not None, attn_mask is not None.
+        If key_mask is not None, then attn_mask is not None.
         So, construct the combined attention mask for SDA
         """
         if key_mask is not None:  # always True during pre-training
@@ -212,34 +223,25 @@ class CrossMultiHeadAttention(MultiHeadAttention):
 
         return qkv
 
-    def attention_forward(self, q_proj: Tensor, k_proj: Tensor, v_proj: Tensor, key_mask: Optional[Tensor] = None) -> Tensor:
-        """
-        CrossAttention does not receive attn_mask argument.
-        key_mask is used for padding audio encoding
-        """
-        return super().attention_forward(q_proj, k_proj, v_proj, attn_mask=key_mask)
-
     def forward(
             self,
             query: Tensor,
             content: Tensor,
             cos_sin: tuple[Tensor, Tensor, Tensor, Tensor],
-            key_mask: Optional[Tensor]=None,
+            attn_mask: Optional[Tensor]=None,
             kv_cache: Optional[dict]=None) -> Tensor:
         """
-        CrossAttention does not receive attn_mask argument
+        CrossAttention does not receive key_mask argument
         """
         q_proj, k_proj, v_proj = self.qkv_projection(query, content, cos_sin, kv_cache)
-        return self.attention_forward(q_proj, k_proj, v_proj, key_mask)
+        return self.attention_forward(q_proj, k_proj, v_proj, attn_mask)
 
 
 class DecoderBlock(nn.Module):
     def __init__(self, d_model, nhead, dim_feedforward, dropout, bias) -> None:
         super().__init__()
-        self.sa_k_norm = Dynamic_erf(d_model)
         self.self_attn = SelfMultiHeadAttention(d_model, nhead, dropout, bias)
-        self.ca_q_norm = Dynamic_erf(d_model)
-        self.ca_k_norm = Dynamic_erf(d_model)
+        self.ca_norm = Dynamic_erf(d_model)
         self.cross_attn = CrossMultiHeadAttention(d_model, nhead, dropout, bias)
         self.mlp_norm = Dynamic_erf(d_model)
         self.mlp = MLP(d_model, dim_feedforward, dropout, bias)
@@ -249,16 +251,16 @@ class DecoderBlock(nn.Module):
         WARN: q must be unnormalized in order to do residual connection
         tok_mask is None during inference
         """
-        query = self.self_attn.attention_forward(q_proj, k_proj, v_proj, attn_mask, tok_mask)
-        return q + query
+        hidden = self.self_attn.attention_forward(q_proj, k_proj, v_proj, attn_mask, tok_mask)
+        return q + hidden
 
-    def forward_cross_attn_and_mlp(self, res: Tensor, q_proj: Tensor, k_proj: Tensor, v_proj: Tensor, aud_mask: Optional[Tensor] = None) -> Tensor:
+    def forward_cross_attn_and_mlp(self, res: Tensor, q_proj: Tensor, k_proj: Tensor, v_proj: Tensor, ca_mask: Optional[Tensor] = None) -> Tensor:
         """
         WARN: res must be unnormalized in order to do residual connection
-        aud_mask is None during inference
+        ca_mask is None during inference
         """
-        query = self.cross_attn.attention_forward(q_proj, k_proj, v_proj, aud_mask)
-        res = res + query
+        hidden = self.cross_attn.attention_forward(q_proj, k_proj, v_proj, ca_mask)
+        res = res + hidden
         res = res + self.mlp(self.mlp_norm(res))
         return res
 
@@ -271,7 +273,7 @@ class DecoderBlock(nn.Module):
             attn_mask: Tensor,
             ca_cos_sin: tuple[Tensor, Tensor, Tensor, Tensor],
             tok_mask: Optional[Tensor] = None,
-            aud_mask: Optional[Tensor] = None,
+            ca_mask: Optional[Tensor] = None,
             kv_cache: Optional[tuple[Optional[KVCache], Optional[dict]]] = (None, None)
             ) -> Tensor:
         """
@@ -281,10 +283,10 @@ class DecoderBlock(nn.Module):
         length-aware RoPE on q_proj and k_proj right before attention forward
         """
         # NOTE: q is not normalized when passing to self_attn cuz it is used as q_proj, and I only apply rotation.
-        query = self.self_attn(q, self.sa_k_norm(ctx), sa_cos_sin, attn_mask, tok_mask, kv_cache[0])
-        res = q + query
-        query = self.cross_attn(self.ca_q_norm(res), self.ca_k_norm(aud), ca_cos_sin, aud_mask, kv_cache[1])
-        res = res + query
+        hidden = self.self_attn(q, ctx, sa_cos_sin, attn_mask, tok_mask, kv_cache[0])
+        res = q + hidden
+        hidden = self.cross_attn(self.ca_norm(res), aud, ca_cos_sin, ca_mask, kv_cache[1])
+        res = res + hidden
         res = res + self.mlp(self.mlp_norm(res))
         return res
 
@@ -299,8 +301,7 @@ class LengthPredictor(nn.Module):
         self.task_embed = nn.Embedding(3, n_embed)  # transcribe, translate, no_speech
         self.dropout = nn.Dropout(dropout)
         # Feature-wise Linear Modulation
-        self.alpha_proj = LinearWrapper(n_embed, n_embed, bias=False)
-        self.beta_proj = LinearWrapper(n_embed, n_embed, bias=False)
+        self.ab_proj = LinearWrapper(n_embed, 2 * n_embed, bias=False)  # alpha, beta projections
         # Output head
         self.head = LinearWrapper(n_embed, 1, bias=bias)
 
@@ -309,10 +310,12 @@ class LengthPredictor(nn.Module):
         task_ids = task_ids - self.transcribe_id  # convert to class: 0 (transcribe) or 1 (translate) or 2 (no_speech)
         task = self.dropout(self.task_embed(task_ids).squeeze(1))  # (b, n_embed)
         # Apply FiLM on the audio encoding
-        alpha = self.alpha_proj(task).unsqueeze(-1)
-        beta = self.beta_proj(task).unsqueeze(-1)
+        alpha, beta = (
+            self.ab_proj(task)
+            .view(task.shape[0], 2, -1, 1)
+            .unbind(1)
+        )
         x = aud_enc.transpose(1, 2).contiguous()    # (b, n_embed, lk)
-        # x = alpha * x + beta
 
         x = self.conv3(x)
         x = alpha * x + beta
@@ -325,12 +328,9 @@ class LengthPredictor(nn.Module):
             # masked_global_avg_pool1d
             x = x.sum(dim=-1, keepdim=True)  # (b, n_embed, 1)
             valid_counts = mask.sum(dim=-1, keepdim=True)  # (b, 1, 1)
-            x = x / (valid_counts + 1e-9)    # (b, n_embed, 1)
+            x = x / (valid_counts + 1e-6)    # (b, n_embed, 1)
         else:
             x = F.adaptive_avg_pool1d(F.gelu(x), 1)  # (b, n_embed, 1)
-
-        # # Apply FiLM on the average of audio encoding
-        # x = alpha * x + beta
 
         # Output logits
         logits = self.head(x.squeeze(-1)).squeeze(-1)
@@ -363,6 +363,7 @@ class TrorYongASRModel(
 ):
     def __init__(self, config: TrorYongASRConfig, verbose: bool=True) -> None:
         super().__init__()
+        #TODO: change mask type to boolean
         self.config = config
 
         self.encoder = AudioEncoder(
@@ -388,6 +389,8 @@ class TrorYongASRModel(
         self.vocab_size = config.vocab_size
         self.pad_vocab_size = (config.vocab_size + 31) // 32 * 32
         self.tok_embed = nn.Embedding(self.pad_vocab_size, config.n_embed, padding_idx=self.config.pad_id)
+        self.aud_norm = Qwen3RMSNorm(config.n_embed)
+        self.ctx_norm = Qwen3RMSNorm(config.n_embed)
         self.lm_norm = Qwen3RMSNorm(config.n_embed)
         self.lm_head = LinearWrapper(config.n_embed, self.pad_vocab_size, bias=False)
 
@@ -434,7 +437,7 @@ class TrorYongASRModel(
     def logits(
             self,
             aud_enc: Tensor,
-            tok_embed: Tensor,
+            ctx: Tensor,
             aud_mask: Optional[Tensor] = None,
             tok_mask: Optional[Tensor] = None,
             pred_seq_len: Optional[float] = 0.0,
@@ -449,12 +452,11 @@ class TrorYongASRModel(
         T0 = 0 if kv_cache[0] is None else kv_cache[0].get_pos()
 
         # decoding layer
-        b, L, _ = tok_embed.size()
+        b, L, _ = ctx.size()
         T1 = T0 + L
         # assert T1 <= self.config.n_text_ctx, "input_ids is too long"
 
         q = self.pos_basis.expand(b, L, -1)
-        ctx = self.dropout(tok_embed)
 
         attn_mask = None
         if L > 1:  # always True during training. During inference, True for the initial tokens
@@ -467,12 +469,16 @@ class TrorYongASRModel(
             actual_seq_len = torch.sum(tok_mask, dim=-1, dtype=torch.float32)  # (b, )
             actual_aud_len = torch.sum(aud_mask, dim=-1, dtype=torch.float32)  # (b, )
             # convert boolean masks to float masks
+            # combine tok_mask and aud_mask to create cross-attention mask
+            ca_mask = tok_mask.unsqueeze(-1) & aud_mask.unsqueeze(1)  # (b, L, lk)
+            ca_mask = torch.where(ca_mask, 0.0, -float('inf'))
+            ca_mask = ca_mask.unsqueeze(1)
+
             tok_mask = torch.where(tok_mask, 0.0, -float('inf'))
-            tok_mask = tok_mask.view(b, 1, 1, -1).expand(-1, self.n_head, L, -1)
-            aud_mask = torch.where(aud_mask, 0.0, -float('inf'))
-            aud_mask = aud_mask.view(b, 1, 1, -1).expand(-1, self.n_head, L, -1)
+            tok_mask = tok_mask.view(b, 1, 1, -1)
             seq_len = L
         else:  # not training, ignore tok_mask, and aud_mask
+            ca_mask = None
             actual_seq_len = None
             actual_aud_len = None
             seq_len = pred_seq_len if T1 < pred_seq_len else T1
@@ -482,22 +488,24 @@ class TrorYongASRModel(
         k_cos, k_sin = self.compute_cos_sin(aud_enc.shape[1], self.device, actual_aud_len, q.dtype)
         ca_cos_sin = q_cos[:, :, T0:T1], q_sin[:, :, T0:T1], k_cos, k_sin
 
-        res = self.decoder(q, ctx, aud_enc, sa_cos_sin, attn_mask, ca_cos_sin, tok_mask, aud_mask, kv_cache)
-        return self.lm_head(self.lm_norm(res))  # (b, L, pad_vocab_size)
+        res = self.decoder(q, ctx, aud_enc, sa_cos_sin, attn_mask, ca_cos_sin, tok_mask, ca_mask, kv_cache)
+        logits = self.lm_head(self.lm_norm(res))  # (b, L, pad_vocab_size)
+        return logits[..., :self.vocab_size]
 
-    def forward(self, mels: Tensor, input_ids: Tensor, target_ids: Optional[Tensor] = None) -> CausalLMOutput:
+    def forward(self, mels: Tensor, mel_masks: Tensor, input_ids: Tensor, target_ids: Optional[Tensor] = None) -> CausalLMOutput:
         """
         mels: log-mel spectrum from audio array
         input_ids: input token ids for decoder (inclu. sot sequence)
         target_ids: target token ids to compute cross_entropy loss
         """
 
-        # NOTE: in Whisper Audio Encoder, the audio encoding is already normalized by ln_post()
-        aud_enc, aud_mask = self.encoder.forward(mels)
+        # NOTE: in Whisper Audio Encoder, the audio encoding is not normalized by ln_post()
+        aud_enc, aud_mask = self.encoder(mels, mel_masks)
         tok_mask = input_ids != self.config.pad_id
-        tok_embed = self.get_token_embedding(input_ids)
+        ctx = self.get_token_embedding(input_ids)
+        ctx = self.dropout(ctx)
         if target_ids is None:
-            logits = self.logits(aud_enc, tok_embed, aud_mask, tok_mask)  # (b, L, pad_vocab_size)
+            logits = self.logits(self.aud_norm(aud_enc), self.ctx_norm(ctx), aud_mask, tok_mask)  # (b, L, pad_vocab_size)
             # do not compute loss
             return CausalLMOutput(logits=logits)
         else:
@@ -507,7 +515,7 @@ class TrorYongASRModel(
             target_len = torch.sum(tok_mask, dim=-1, dtype=torch.float32)
             loss = F.smooth_l1_loss(pred_len.float(), target_len, beta=1.0)
 
-            logits = self.logits(aud_enc, tok_embed, aud_mask, tok_mask)  # (b, L, pad_vocab_size)
+            logits = self.logits(self.aud_norm(aud_enc), self.ctx_norm(ctx), aud_mask, tok_mask)  # (b, L, pad_vocab_size)
             loss += F.cross_entropy(logits.flatten(end_dim=1).float(), target_ids.flatten(), ignore_index=-100, reduction='mean')
 
             return CausalLMOutput(logits=logits, loss=loss)
@@ -555,8 +563,8 @@ class TrorYongASRModel(
         aud_enc = self.encoder.encode(mels)
 
         idx = torch.as_tensor([[tokenizer.sot]], dtype=torch.long, device=self.device)
-        tok_embed = self.get_token_embedding(idx)
-        logits = self.logits(aud_enc, tok_embed, pred_seq_len=1.0)
+        ctx = self.get_token_embedding(idx)
+        logits = self.logits(self.aud_norm(aud_enc), self.ctx_norm(ctx), pred_seq_len=1.0)
 
         # suppress non-language tokens
         mask = torch.ones(logits.shape[-1], dtype=torch.bool)
@@ -598,17 +606,17 @@ class TrorYongASRModel(
 
         mels = mel.unsqueeze(0)
         aud_enc = self.encoder.encode(mels)
+
         idx = torch.as_tensor([self.prefix], dtype=torch.long, device=mels.device)
-        tok_embed = self.get_token_embedding(idx)
+        ctx = self.get_token_embedding(idx)
         n = idx.shape[1]
 
         # predict seq_len
         pred_seq_len = self.len_predictor(aud_enc, idx[:, [2]])
 
-        next_embed = tok_embed
+        aud_enc = self.aud_norm(aud_enc)  # normalize outside the for-loop to save compute
         for i in range(n, max_tokens):
-            logits = self.logits(aud_enc, next_embed, pred_seq_len=pred_seq_len, kv_cache=kv_cache)
-            logits[:, -1, self.vocab_size:] = -float('inf')     # suppress the pad tokens
+            logits = self.logits(aud_enc, self.ctx_norm(ctx), pred_seq_len=pred_seq_len, kv_cache=kv_cache)
 
             if temperature > 0:
                 logits = logits[:, -1, :] / temperature
@@ -622,7 +630,7 @@ class TrorYongASRModel(
             idx = torch.cat((idx, id_next), dim=1)
             if id_next.item() == self.config.eot_id:
                 break
-            next_embed = self.get_token_embedding(id_next)
+            ctx = self.get_token_embedding(id_next)
         return idx[0]
 
     @torch.no_grad()
@@ -632,22 +640,18 @@ class TrorYongASRModel(
 
         s = 3**0.5 * self.config.n_embed**-0.5
         for block in self.encoder.blocks:
-            nn.init.uniform_(block.attn.query.weight, -s, s)
-            nn.init.uniform_(block.attn.key.weight, -s, s)
-            nn.init.uniform_(block.attn.value.weight, -s, s)
+            nn.init.uniform_(block.attn.qkv_proj.weight, -s, s)
             nn.init.zeros_(block.attn.out.weight)
             nn.init.uniform_(block.mlp[0].weight, -s * 0.4, s * 0.4)
             nn.init.zeros_(block.mlp[2].weight)
 
-        nn.init.uniform_(self.decoder.self_attn.g_proj.weight, -s, s)
-        nn.init.uniform_(self.decoder.self_attn.k_proj.weight, -s, s)
-        nn.init.uniform_(self.decoder.self_attn.v_proj.weight, -s, s)
+        nn.init.uniform_(self.decoder.self_attn.gate.weight, -s, s)
+        nn.init.uniform_(self.decoder.self_attn.kv_proj.weight, -s, s)
         nn.init.zeros_(self.decoder.self_attn.out_proj.weight)
 
         nn.init.uniform_(self.decoder.cross_attn.q_proj.weight, -s, s)
-        nn.init.uniform_(self.decoder.cross_attn.g_proj.weight, -s, s)
-        nn.init.uniform_(self.decoder.cross_attn.k_proj.weight, -s, s)
-        nn.init.uniform_(self.decoder.cross_attn.v_proj.weight, -s, s)
+        nn.init.uniform_(self.decoder.cross_attn.gate.weight, -s, s)
+        nn.init.uniform_(self.decoder.cross_attn.kv_proj.weight, -s, s)
         nn.init.zeros_(self.decoder.cross_attn.out_proj.weight)
 
         nn.init.uniform_(self.decoder.mlp.gate_proj.weight, -s * 0.4, s * 0.4)
@@ -657,12 +661,12 @@ class TrorYongASRModel(
         nn.init.kaiming_normal_(self.len_predictor.conv3.weight, mode='fan_out', nonlinearity='relu')
         nn.init.trunc_normal_(self.len_predictor.task_embed.weight, std=1.0)
         nn.init.normal_(self.len_predictor.head.weight, mean=0.0, std=0.001)
-        nn.init.zeros_(self.len_predictor.beta_proj.weight)
-        if self.len_predictor.beta_proj.bias is not None:
-            nn.init.zeros_(self.len_predictor.beta_proj.bias)
-        nn.init.zeros_(self.len_predictor.alpha_proj.weight)
-        if self.len_predictor.alpha_proj.bias is not None:
-            nn.init.ones_(self.len_predictor.alpha_proj.bias)
+        # nn.init.zeros_(self.len_predictor.beta_proj.weight)
+        # if self.len_predictor.beta_proj.bias is not None:
+        #     nn.init.zeros_(self.len_predictor.beta_proj.bias)
+        nn.init.zeros_(self.len_predictor.ab_proj.weight)
+        if self.len_predictor.ab_proj.bias is not None:
+            nn.init.ones_(self.len_predictor.ab_proj.bias)
 
         # Embedding
         nn.init.normal_(self.tok_embed.weight, mean=0.0, std=0.001)
