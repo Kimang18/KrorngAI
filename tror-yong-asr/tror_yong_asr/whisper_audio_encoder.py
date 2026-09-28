@@ -45,7 +45,7 @@ class MultiHeadAttention(nn.Module):
         attn_mask = None
         if key_mask is not None:
             b, L = key_mask.shape
-            attn_mask = key_mask.view(b, 1, 1, L).expand(-1, self.n_head, L, -1)
+            attn_mask = key_mask.view(b, 1, 1, L)
 
         qkv = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=False)
         qkv = qkv.permute(0, 2, 1, 3).flatten(start_dim=2)

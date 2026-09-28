@@ -96,7 +96,7 @@ class MultiHeadAttention(nn.Module):
     def qkv_projection(self, query, content, cos_sin, kv_cache=None) -> tuple[Tensor, Tensor, Tensor]:
         """
         Compute and return the projection of query, key, and value
-        query and content must be normalized
+        query and content must be **normalized**
         cos_sin is a tuple [q_cos, q_sin, k_cos, k_sin]
         """
         raise NotImplementedError()
@@ -131,6 +131,7 @@ class SelfMultiHeadAttention(MultiHeadAttention):
         super().__init__(n_embed, n_head, dropout, bias)
         # Specific to this design, self-attention does not require q_proj
         self.q_proj = nn.Identity()
+        #TODO: change q_norm to identity()?
 
     def qkv_projection(
             self,
@@ -166,9 +167,10 @@ class SelfMultiHeadAttention(MultiHeadAttention):
         """
         If key_mask is not None, then attn_mask is not None.
         So, construct the combined attention mask for SDA
+        # key_mask: (b, 1, 1, lk), True means valid token, False means pad token
         """
         if key_mask is not None:  # always True during pre-training
-            attn_mask = attn_mask.unsqueeze(0).unsqueeze(0) + key_mask
+            attn_mask = key_mask & attn_mask.unsqueeze(0).unsqueeze(0)
         return super().attention_forward(q_proj, k_proj, v_proj, attn_mask)
 
     def forward(
@@ -228,13 +230,14 @@ class CrossMultiHeadAttention(MultiHeadAttention):
             query: Tensor,
             content: Tensor,
             cos_sin: tuple[Tensor, Tensor, Tensor, Tensor],
-            attn_mask: Optional[Tensor]=None,
+            key_mask: Optional[Tensor]=None,
             kv_cache: Optional[dict]=None) -> Tensor:
         """
-        CrossAttention does not receive key_mask argument
+        CrossAttention does not receive attn_mask argument
+        key_mask: (b, 1, 1, lk), True means valid frame, False means pad frame
         """
         q_proj, k_proj, v_proj = self.qkv_projection(query, content, cos_sin, kv_cache)
-        return self.attention_forward(q_proj, k_proj, v_proj, attn_mask)
+        return self.attention_forward(q_proj, k_proj, v_proj, key_mask)
 
 
 class DecoderBlock(nn.Module):
@@ -254,12 +257,12 @@ class DecoderBlock(nn.Module):
         hidden = self.self_attn.attention_forward(q_proj, k_proj, v_proj, attn_mask, tok_mask)
         return q + hidden
 
-    def forward_cross_attn_and_mlp(self, res: Tensor, q_proj: Tensor, k_proj: Tensor, v_proj: Tensor, ca_mask: Optional[Tensor] = None) -> Tensor:
+    def forward_cross_attn_and_mlp(self, res: Tensor, q_proj: Tensor, k_proj: Tensor, v_proj: Tensor, aud_mask: Optional[Tensor] = None) -> Tensor:
         """
         WARN: res must be unnormalized in order to do residual connection
         ca_mask is None during inference
         """
-        hidden = self.cross_attn.attention_forward(q_proj, k_proj, v_proj, ca_mask)
+        hidden = self.cross_attn.attention_forward(q_proj, k_proj, v_proj, aud_mask)
         res = res + hidden
         res = res + self.mlp(self.mlp_norm(res))
         return res
@@ -273,30 +276,32 @@ class DecoderBlock(nn.Module):
             attn_mask: Tensor,
             ca_cos_sin: tuple[Tensor, Tensor, Tensor, Tensor],
             tok_mask: Optional[Tensor] = None,
-            ca_mask: Optional[Tensor] = None,
+            aud_mask: Optional[Tensor] = None,
             kv_cache: Optional[tuple[Optional[KVCache], Optional[dict]]] = (None, None)
             ) -> Tensor:
         """
         regular forward pass
-        WARN: q must be unnormalized in order to do residual connection
-        NOTE: LARoPE implementation in cross attention - apply
-        length-aware RoPE on q_proj and k_proj right before attention forward
+        WARN: ctx and aud must be already normalized
+        NOTE: LARoPE implementation in cross attention - apply length-aware
+        RoPE on q_proj and k_proj right before attention forward
         """
         # NOTE: q is not normalized when passing to self_attn cuz it is used as q_proj, and I only apply rotation.
         hidden = self.self_attn(q, ctx, sa_cos_sin, attn_mask, tok_mask, kv_cache[0])
         res = q + hidden
-        hidden = self.cross_attn(self.ca_norm(res), aud, ca_cos_sin, ca_mask, kv_cache[1])
+        hidden = self.cross_attn(self.ca_norm(res), aud, ca_cos_sin, aud_mask, kv_cache[1])
         res = res + hidden
         res = res + self.mlp(self.mlp_norm(res))
         return res
 
 
 class LengthPredictor(nn.Module):
-    def __init__(self, n_text_ctx: int, transcribe_id:int, n_embed: int, dropout: float, bias: bool):
+    def __init__(self, n_text_ctx: int, pad_id: int, eot_id: int, transcribe_id: int, n_embed: int, dropout: float, bias: bool):
         super().__init__()
         self.half_text_ctx = 0.5 * n_text_ctx
+        self.pad_id = pad_id
+        self.eot_id = eot_id
         self.transcribe_id = transcribe_id
-        self.no_speech_id = transcribe_id + 2  # this is due to my tokenizer design
+        self.no_speech_id = transcribe_id + 2  # this is due to TrorYongASR tokenizer design
         self.conv3 = Conv1dWrapper(n_embed, n_embed, kernel_size=5, stride=5)
         self.task_embed = nn.Embedding(3, n_embed)  # transcribe, translate, no_speech
         self.dropout = nn.Dropout(dropout)
@@ -306,13 +311,17 @@ class LengthPredictor(nn.Module):
         self.head = LinearWrapper(n_embed, 1, bias=bias)
 
     def forward(self, aud_enc: Tensor, task_ids: Tensor, aud_mask: Optional[Tensor] = None) -> Tensor:
-        task_ids.masked_fill_(task_ids == 2, self.no_speech_id)  # for no_speech case, replace eot_id by no_speech_id
+        """
+        aud_enc: (b, n_mels, n_frames)
+        task_ids: (b, 1)
+        """
+        task_ids.masked_fill_((task_ids == self.pad_id) | (task_ids == self.eot_id), self.no_speech_id)  # for no_speech case, replace eot_id or pad_id by no_speech_id
         task_ids = task_ids - self.transcribe_id  # convert to class: 0 (transcribe) or 1 (translate) or 2 (no_speech)
         task = self.dropout(self.task_embed(task_ids).squeeze(1))  # (b, n_embed)
         # Apply FiLM on the audio encoding
         alpha, beta = (
             self.ab_proj(task)
-            .view(task.shape[0], 2, -1, 1)
+            .view(task.shape[0], 2, -1, 1)  # the last dim is 1 for broadcasting at the feature dimension of x
             .unbind(1)
         )
         x = aud_enc.transpose(1, 2).contiguous()    # (b, n_embed, lk)
@@ -350,7 +359,7 @@ class TrorYongASRConfig:
     dropout: float = 0.0
     bias: bool = True
     gamma: float = 10.0  # scaling factor for LARoPE
-    rope_percentage: float = 0.75
+    rope_percentage: float = 0.75  # for p-RoPE and p-LARoPE
     pad_id: int = 0
     eot_id: int = 2
     transcribe_id: int = 48002
@@ -363,7 +372,6 @@ class TrorYongASRModel(
 ):
     def __init__(self, config: TrorYongASRConfig, verbose: bool=True) -> None:
         super().__init__()
-        #TODO: change mask type to boolean
         self.config = config
 
         self.encoder = AudioEncoder(
@@ -415,13 +423,16 @@ class TrorYongASRModel(
         # Sequence Length Predictor, used for LARoPE's inference
         self.len_predictor = LengthPredictor(
             config.n_text_ctx,
+            config.pad_id,
+            config.eot_id,
             config.transcribe_id,
             config.n_embed,
             config.dropout,
             config.bias
         )  # sequence length predictor specific to LARoPE
 
-        mask = torch.empty(config.n_text_ctx, config.n_text_ctx).fill_(-float('inf')).triu_(1)
+        # mask = torch.empty(config.n_text_ctx, config.n_text_ctx).fill_(-float('inf')).triu_(1)
+        mask = torch.tril(torch.ones((self.config.n_text_ctx, self.config.n_text_ctx), dtype=torch.bool))
         self.register_buffer("mask", mask, persistent=False)
         self.prefix = None
         self.init_weights()
@@ -468,17 +479,16 @@ class TrorYongASRModel(
         if pred_seq_len == 0.0:  # always True during training
             actual_seq_len = torch.sum(tok_mask, dim=-1, dtype=torch.float32)  # (b, )
             actual_aud_len = torch.sum(aud_mask, dim=-1, dtype=torch.float32)  # (b, )
-            # convert boolean masks to float masks
-            # combine tok_mask and aud_mask to create cross-attention mask
-            ca_mask = tok_mask.unsqueeze(-1) & aud_mask.unsqueeze(1)  # (b, L, lk)
-            ca_mask = torch.where(ca_mask, 0.0, -float('inf'))
-            ca_mask = ca_mask.unsqueeze(1)
 
-            tok_mask = torch.where(tok_mask, 0.0, -float('inf'))
-            tok_mask = tok_mask.view(b, 1, 1, -1)
+            # NOTE: combine tok_mask and aud_mask to create cross-attention mask
+            # can avoid unnecessary computation from padding tokens but may not
+            # accelerate the training speed. So, commented out below
+            # aud_mask = tok_mask.unsqueeze(-1) & aud_mask.unsqueeze(1)  # (b, L, lk)
+            # aud_mask = aud_mask.unsqueeze(1)
+            aud_mask = aud_mask.view(b, 1, 1, -1)  # (b, 1, 1, lk)
+            tok_mask = tok_mask.view(b, 1, 1, -1)  # (b, 1, 1, L)
             seq_len = L
         else:  # not training, ignore tok_mask, and aud_mask
-            ca_mask = None
             actual_seq_len = None
             actual_aud_len = None
             seq_len = pred_seq_len if T1 < pred_seq_len else T1
@@ -488,7 +498,7 @@ class TrorYongASRModel(
         k_cos, k_sin = self.compute_cos_sin(aud_enc.shape[1], self.device, actual_aud_len, q.dtype)
         ca_cos_sin = q_cos[:, :, T0:T1], q_sin[:, :, T0:T1], k_cos, k_sin
 
-        res = self.decoder(q, ctx, aud_enc, sa_cos_sin, attn_mask, ca_cos_sin, tok_mask, ca_mask, kv_cache)
+        res = self.decoder(q, ctx, aud_enc, sa_cos_sin, attn_mask, ca_cos_sin, tok_mask, aud_mask, kv_cache)
         logits = self.lm_head(self.lm_norm(res))  # (b, L, pad_vocab_size)
         return logits[..., :self.vocab_size]
 
@@ -661,9 +671,6 @@ class TrorYongASRModel(
         nn.init.kaiming_normal_(self.len_predictor.conv3.weight, mode='fan_out', nonlinearity='relu')
         nn.init.trunc_normal_(self.len_predictor.task_embed.weight, std=1.0)
         nn.init.normal_(self.len_predictor.head.weight, mean=0.0, std=0.001)
-        # nn.init.zeros_(self.len_predictor.beta_proj.weight)
-        # if self.len_predictor.beta_proj.bias is not None:
-        #     nn.init.zeros_(self.len_predictor.beta_proj.bias)
         nn.init.zeros_(self.len_predictor.ab_proj.weight)
         if self.len_predictor.ab_proj.bias is not None:
             nn.init.ones_(self.len_predictor.ab_proj.bias)
@@ -688,7 +695,8 @@ class TrorYongASRModel(
             base ** (torch.arange(0, 2 * rope_angles, 2, dtype=torch.float32) / self.head_dim)
         )
 
-        self.mask = torch.empty(self.config.n_text_ctx, self.config.n_text_ctx).fill_(-float('inf')).triu_(1)
+        # self.mask = torch.empty(self.config.n_text_ctx, self.config.n_text_ctx).fill_(-float('inf')).triu_(1)
+        self.mask = torch.tril(torch.ones((self.config.n_text_ctx, self.config.n_text_ctx), dtype=torch.bool))
 
         if self.tok_embed.weight.device.type == 'cuda':
             self.tok_embed.weight = self.tok_embed.weight.to(torch.bfloat16)
