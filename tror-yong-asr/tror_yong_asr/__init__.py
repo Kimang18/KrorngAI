@@ -8,16 +8,19 @@ from .model import TrorYongASRModel, TrorYongASRConfig
 from ._version import __version__
 
 
-TaskOutput = namedtuple("TaskOutput", "output_ids text")
-# hard-coded audio hyperparameters
+TaskOutput = namedtuple("TaskOutput", "pred_ids text")
 
 
 def load_mel_spectrogram(audio: Union[str, np.ndarray], processor) -> Tensor:
-    import torchaudio
     SAMPLE_RATE = 16_000  # TrorYongASR is trained with this rate
     if isinstance(audio, str):  # file_name
+        import torchaudio
+
         # load audio directly to a tensor
         waveform, sample_rate = torchaudio.load(audio)
+        # convert to mono channel
+        if waveform.shape[0] > 1:
+            waveform = waveform.mean(dim=0, keepdim=True)
         # resample if necessary (my model accepts 16kHz)
         if sample_rate != SAMPLE_RATE:
             resampler = torchaudio.transforms.Resample(sample_rate, SAMPLE_RATE)
@@ -60,9 +63,9 @@ def _task_handling(audio: Union[str, np.ndarray], model: TrorYongASRModel, proce
 
     mel = load_mel_spectrogram(audio, processor)
 
-    output_ids = model.decode(mel, max_tokens, temperature, top_k, seed)
-    text = processor.decode(output_ids, skip_special_tokens=True)
-    return TaskOutput(text=text, output_ids=output_ids)
+    pred_ids = model.decode(mel, max_tokens, temperature, top_k, seed)
+    text = processor.decode(pred_ids, skip_special_tokens=True)
+    return TaskOutput(text=text, pred_ids=pred_ids)
 
 
 transcribe = partial(_task_handling, task='transcribe')
