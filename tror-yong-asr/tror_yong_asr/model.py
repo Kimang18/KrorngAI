@@ -2,13 +2,13 @@
 # Date: March 2026
 """
 Features:
-- text decoder with a single transformer block
+- auditory-lingual decoder with a single Transformer
 - gated multi-head attention
 - exclusive self-attention
 - p-RoPE in self-attention
 - p-LARoPE in cross-attention
-- Dynamic Error Function instead of normalization layer in text decoder
-- head-specific QK-normalization with Derf before SDP
+- Derf instead of normalization layer in decoder
+- head-specific QK-normalization with Derf before SDP attn
 - SiLU gate in MLP of transformer
 - during inference, accepts audio array of arbitrary length <= 30 * 16_000
 """
@@ -65,8 +65,7 @@ class MultiHeadAttention(nn.Module):
 
     def q_projection(self, query: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
         """
-        Compute and return the projection of query
-        NOTE: it returns a tuple of tensor, query projection, and gate score
+        Compute and return query vector
         """
         q = (
             self.q_norm(self.q_proj(query))
@@ -78,14 +77,8 @@ class MultiHeadAttention(nn.Module):
 
     def kv_projection(self, content: Tensor, cos: Tensor, sin: Tensor) -> tuple[Tensor, Tensor]:
         """
-        Compute and return the projections for key and value
+        Compute and return key and value vectors
         """
-        # k, v = (
-        #     self.kv_proj(content)
-        #     .view(*content.shape[:2], 2, self.n_head, -1)
-        #     .permute(2, 0, 3, 1, 4)
-        #     .unbind(0)
-        # )
         k, v = self.kv_proj(content).chunk(2, dim=-1)
         k = (
             self.k_norm(k)
@@ -98,7 +91,7 @@ class MultiHeadAttention(nn.Module):
 
     def qkv_projection(self, query, content, cos_sin, kv_cache=None) -> tuple[tuple[Tensor, Tensor], Tensor, Tensor]:
         """
-        Compute and return the projection of query, key, and value
+        Compute and return query, key, and value vectors
         query and content must be **normalized**
         cos_sin is a tuple [q_cos, q_sin, k_cos, k_sin]
         """
@@ -113,10 +106,10 @@ class MultiHeadAttention(nn.Module):
 
     def attention_forward(self, q_proj: tuple[Tensor, Tensor], k_proj: Tensor, v_proj: Tensor, attn_mask: Optional[Tensor] = None) -> Tensor:
         """
-        Given the q_proj, k_proj, v_proj projections and attention mask, return the attention output
+        Given the q_proj, k_proj, v_proj vectors and attention mask, return the attention output
         NOTE: we separate this function to save time as we use different attention masks
         for the same query, key, and value, and qkv projection requires compute and time
-        NOTE: q_proj is a tuple of tensors, query projection and gate projection
+        NOTE: q_proj is a tuple of tensors, query vector and gate scores
         """
         qkv = F.scaled_dot_product_attention(q_proj[0], k_proj, v_proj, dropout_p=self.dropout.p, attn_mask=attn_mask, is_causal=False)
         qkv = self.exclude_self_value(qkv, v_proj)
@@ -141,9 +134,9 @@ class SelfMultiHeadAttention(MultiHeadAttention):
         k, v = super().kv_projection(content, cos, sin)
 
         g_score = (
-            self.gate(content)  # (b, lq, n_head)
+            self.gate(content)  # (b, lk, n_head)
             .transpose(1, 2)
-            .unsqueeze(-1)  # (b, n_head, lq, 1)
+            .unsqueeze(-1)  # (b, n_head, lk, 1)
         )
         return k, v, g_score
 
@@ -169,6 +162,7 @@ class SelfMultiHeadAttention(MultiHeadAttention):
         """
         Project qkv to subspace that is orthogonal to v_proj
         to perform exclusive self-attention
+        https://arxiv.org/pdf/2603.09078
         """
         if qkv.shape == v_proj.shape:
             vn = F.normalize(v_proj, dim=-1, eps=1e-6)
@@ -183,6 +177,7 @@ class SelfMultiHeadAttention(MultiHeadAttention):
         # key_mask: (b, 1, 1, lk), True means valid token, False means pad token
         """
         if key_mask is not None:  # always True during pre-training
+            # assert attn_mask.shape == key_mask.shape
             attn_mask = key_mask & attn_mask
         return super().attention_forward(q_proj, k_proj, v_proj, attn_mask)
 
@@ -289,8 +284,7 @@ class DecoderBlock(nn.Module):
         """
         regular forward pass
         WARN: ctx and aud must be already normalized
-        NOTE: LARoPE implementation in cross attention - apply length-aware
-        RoPE on q_proj and k_proj right before attention forward
+        NOTE: sa_cos_sin for RoPE and ca_cos_sin for LARoPE
         """
         # NOTE: q is not normalized when passing to self_attn cuz it is used as q_proj, and I only apply rotation.
         hidden = q + self.self_attn(q, ctx, sa_cos_sin, attn_mask, tok_mask, kv_cache[0])
@@ -430,7 +424,7 @@ class TrorYongASRModel(
 
         self.register_buffer("gamma_inv_freq", gamma_inv_freq, persistent=False)
 
-        # Sequence Length Predictor, used for LARoPE's inference
+        # Sequence Length Predictor, used for LARoPE during inference
         self.len_predictor = LengthPredictor(
             config.n_text_ctx,
             config.pad_token_id,
@@ -467,7 +461,8 @@ class TrorYongASRModel(
         tok_mask: True means valid token, False means pad token
         aud_mask: True means valid frame, False means pad frame
         pred_seq_len: predicted number of tokens for LARoPE
-        NOTE: when pred_seq_len != 0, ignore tok_mask, aud_mask
+        NOTE: ctx and aud_enc must be already normalized
+        WARN: when pred_seq_len != 0, ignore tok_mask, aud_mask
         """
         T0 = 0 if kv_cache[0] is None else kv_cache[0].get_pos()
 
@@ -489,11 +484,6 @@ class TrorYongASRModel(
             actual_seq_len = torch.sum(tok_mask, dim=-1, dtype=torch.float32)  # (b, )
             actual_aud_len = torch.sum(aud_mask, dim=-1, dtype=torch.float32)  # (b, )
 
-            # NOTE: combine tok_mask and aud_mask to create cross-attention mask
-            # can avoid unnecessary computation from padding tokens but may not
-            # accelerate the training speed. So, commented out below
-            # aud_mask = tok_mask.unsqueeze(-1) & aud_mask.unsqueeze(1)  # (b, L, lk)
-            # aud_mask = aud_mask.unsqueeze(1)
             aud_mask = aud_mask.view(b, 1, 1, -1)  # (b, 1, 1, lk)
             tok_mask = tok_mask.view(b, 1, 1, -1)  # (b, 1, 1, L)
             seq_len = L
@@ -513,7 +503,7 @@ class TrorYongASRModel(
 
     def forward(self, mels: Tensor, mel_masks: Tensor, input_ids: Tensor, labels: Optional[Tensor] = None) -> CausalLMOutput:
         """
-        mels: log-mel spectrum from audio array
+        mels: log-mel spectrogram
         mel_masks: True means valid frame, False means pad frame
         input_ids: input token ids for decoder (inclu. sot sequence)
         labels: target token ids to compute cross_entropy loss
@@ -530,7 +520,7 @@ class TrorYongASRModel(
             return CausalLMOutput(logits=logits)
         else:
             # predict sequence length
-            # pred_len is bounded on [0, n_text_ctx] via softcap and shift
+            # pred_len is bounded on (0, n_text_ctx) via softcap and shift
             pred_len = self.len_predictor(aud_enc.detach(), input_ids[:, [2]], aud_mask)
             target_len = torch.sum(tok_mask, dim=-1, dtype=torch.float32)
             len_loss = F.smooth_l1_loss(pred_len.float(), target_len, beta=1.0)
@@ -622,7 +612,7 @@ class TrorYongASRModel(
     @torch.inference_mode()
     def decode(self, mel: Tensor, max_tokens: int, temperature=1.0, top_k=None, seed=168) -> Tensor:
         """
-        mel: (n_mels,)
+        mel: (n_mels, n_frames)
         max_tokens: int
         return: list of token ids
         """
@@ -722,7 +712,6 @@ class TrorYongASRModel(
             base ** (torch.arange(0, 2 * rope_angles, 2, dtype=torch.float32) / self.head_dim)
         )
 
-        # self.mask = torch.empty(self.config.n_text_ctx, self.config.n_text_ctx).fill_(-float('inf')).triu_(1)
         self.mask = torch.tril(torch.ones((self.config.n_text_ctx, self.config.n_text_ctx), dtype=torch.bool))
 
         if self.tok_embed.weight.device.type == 'cuda':
