@@ -20,7 +20,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from torch.nn.utils.rnn import pad_sequence
 from transformers.modeling_outputs import CausalLMOutput
+from transformers import GenerationConfig
 from huggingface_hub import PyTorchModelHubMixin
 from .nn_utils import (
     precompute_rotary_emb,
@@ -34,6 +36,14 @@ from .nn_utils import (
 )
 from .common import print_banner
 from .whisper_audio_encoder import AudioEncoder
+
+
+@dataclass
+class CustomCausalLMOutput(CausalLMOutput):
+    logits: torch.FloatTensor = None
+    loss: torch.FloatTensor = None
+    dec_loss: torch.FloatTensor = None
+    len_loss: torch.FloatTensor = None
 
 
 class MultiHeadAttention(nn.Module):
@@ -53,7 +63,7 @@ class MultiHeadAttention(nn.Module):
         self.q_norm = Dynamic_erf(n_embed)
         self.k_norm = Dynamic_erf(n_embed)
 
-    def q_projection(self, query: Tensor, cos: Tensor, sin: Tensor) -> tuple[Tensor, Tensor]:
+    def q_projection(self, query: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
         """
         Compute and return the projection of query
         NOTE: it returns a tuple of tensor, query projection, and gate score
@@ -64,16 +74,9 @@ class MultiHeadAttention(nn.Module):
             .transpose(1, 2)
         )
         q = apply_rotary_emb(q, cos, sin)
+        return q
 
-        # generate gating score
-        g_score = (
-            self.gate(query)  # (b, lq, n_head)
-            .transpose(1, 2)
-            .unsqueeze(-1)  # (b, n_head, lq, 1)
-        )
-        return (q, g_score)
-
-    def kv_projection(self, content: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+    def kv_projection(self, content: Tensor, cos: Tensor, sin: Tensor) -> tuple[Tensor, Tensor]:
         """
         Compute and return the projections for key and value
         """
@@ -93,7 +96,7 @@ class MultiHeadAttention(nn.Module):
         v = v.view(*v.shape[:2], self.n_head, -1).transpose(1, 2)
         return k, v
 
-    def qkv_projection(self, query, content, cos_sin, kv_cache=None) -> tuple[Tensor, Tensor, Tensor]:
+    def qkv_projection(self, query, content, cos_sin, kv_cache=None) -> tuple[tuple[Tensor, Tensor], Tensor, Tensor]:
         """
         Compute and return the projection of query, key, and value
         query and content must be **normalized**
@@ -122,8 +125,7 @@ class MultiHeadAttention(nn.Module):
         qkv = qkv * torch.sigmoid(q_proj[1])
 
         qkv = qkv.transpose(1, 2).flatten(start_dim=2)      # (b, lq, n_embed)
-        out = self.out_proj(qkv)
-        return self.dropout(out)
+        return self.dropout(self.out_proj(qkv))
 
 
 class SelfMultiHeadAttention(MultiHeadAttention):
@@ -131,26 +133,37 @@ class SelfMultiHeadAttention(MultiHeadAttention):
         super().__init__(n_embed, n_head, dropout, bias)
         # Specific to this design, self-attention does not require q_proj
         self.q_proj = nn.Identity()
-        #TODO: change q_norm to identity()?
+
+    def kv_projection(self, content: Tensor, cos: Tensor, sin: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        """
+        in SelfAttention, compute gate score from content
+        """
+        k, v = super().kv_projection(content, cos, sin)
+
+        g_score = (
+            self.gate(content)  # (b, lq, n_head)
+            .transpose(1, 2)
+            .unsqueeze(-1)  # (b, n_head, lq, 1)
+        )
+        return k, v, g_score
 
     def qkv_projection(
             self,
             query: Tensor,
             content: Tensor,
             cos_sin: tuple[Tensor, Tensor, Tensor, Tensor],
-            kv_cache: Optional[KVCache] = None) -> tuple[Tensor, Tensor, Tensor]:
+            kv_cache: Optional[KVCache] = None) -> tuple[tuple[Tensor, Tensor], Tensor, Tensor]:
         """
         kv_cache stores key and value of previous positions.
         We compute key and value of current position
         and concatenate with the previous ones by kv_cache.insert_kv
         """
         # apply RoPE
-        q_cos, q_sin, k_cos, k_sin = cos_sin
-        q_proj = self.q_projection(query, q_cos, q_sin)  # tuple[(b, n_head, lq, head_dim), (b, n_head, lq, 1)]
-        k_proj, v_proj = self.kv_projection(content, k_cos, k_sin)
+        q_proj = self.q_projection(query, *cos_sin[:2])  # (b, n_head, lq, head_dim)
+        k_proj, v_proj, g_score = self.kv_projection(content, *cos_sin[2:])
         if kv_cache is not None:
             k_proj, v_proj = kv_cache.insert_kv(0, k_proj, v_proj)  # there is only one layer, so layer_idx=0
-        return q_proj, k_proj, v_proj
+        return (q_proj, g_score), k_proj, v_proj
 
     def exclude_self_value(self, qkv: Tensor, v_proj: Tensor) -> Tensor:
         """
@@ -170,7 +183,7 @@ class SelfMultiHeadAttention(MultiHeadAttention):
         # key_mask: (b, 1, 1, lk), True means valid token, False means pad token
         """
         if key_mask is not None:  # always True during pre-training
-            attn_mask = key_mask & attn_mask.unsqueeze(0).unsqueeze(0)
+            attn_mask = key_mask & attn_mask
         return super().attention_forward(q_proj, k_proj, v_proj, attn_mask)
 
     def forward(
@@ -193,30 +206,42 @@ class CrossMultiHeadAttention(MultiHeadAttention):
         super().__init__(n_embed, n_head, dropout, bias)
         self.q_proj = LinearWrapper(n_embed, n_embed, bias=bias)
 
+    def q_projection(self, query: Tensor, cos: Tensor, sin: Tensor) -> tuple[Tensor, Tensor]:
+        """
+        in CrossAttention, compute gate score from query
+        """
+        q_proj = super().q_projection(query, cos, sin)
+
+        g_score = (
+            self.gate(query)  # (b, lq, n_head)
+            .transpose(1, 2)
+            .unsqueeze(-1)  # (b, n_head, lq, 1)
+        )
+        return (q_proj, g_score)
+
     def qkv_projection(
             self,
             query: Tensor,
             content: Tensor,
             cos_sin: tuple[Tensor, Tensor, Tensor, Tensor],
-            kv_cache: Optional[dict] = None) -> tuple[Tensor, Tensor, Tensor]:
+            kv_cache: Optional[dict] = None) -> tuple[tuple[Tensor, Tensor], Tensor, Tensor]:
         """
         cos_sin is length-aware rotation
         kv_cache is a dict that stores projections of audio encoding
         """
         # apply LARoPE
-        q_cos, q_sin, k_cos, k_sin = cos_sin
-        q_proj = self.q_projection(query, q_cos, q_sin)
+        (q_proj, g_score) = self.q_projection(query, *cos_sin[:2])
         if kv_cache is None:
-            k_proj, v_proj = self.kv_projection(content, k_cos, k_sin)
+            k_proj, v_proj = self.kv_projection(content, *cos_sin[2:])
         else:
             k_proj = kv_cache.get('key', None)
             if k_proj is None:
-                k_proj, v_proj = self.kv_projection(content, k_cos, k_sin)
+                k_proj, v_proj = self.kv_projection(content, *cos_sin[2:])
                 kv_cache['key'] = k_proj
                 kv_cache['value'] = v_proj
             else:
                 v_proj = kv_cache['value']
-        return q_proj, k_proj, v_proj
+        return (q_proj, g_score), k_proj, v_proj
 
     def exclude_self_value(self, qkv: Tensor, v_proj: Tensor) -> Tensor:
         """
@@ -249,24 +274,6 @@ class DecoderBlock(nn.Module):
         self.mlp_norm = Dynamic_erf(d_model)
         self.mlp = MLP(d_model, dim_feedforward, dropout, bias)
 
-    def forward_self_attn(self, q: Tensor, q_proj: Tensor, k_proj: Tensor, v_proj: Tensor, attn_mask: Tensor, tok_mask: Optional[Tensor] = None) -> Tensor:
-        """
-        WARN: q must be unnormalized in order to do residual connection
-        tok_mask is None during inference
-        """
-        hidden = self.self_attn.attention_forward(q_proj, k_proj, v_proj, attn_mask, tok_mask)
-        return q + hidden
-
-    def forward_cross_attn_and_mlp(self, res: Tensor, q_proj: Tensor, k_proj: Tensor, v_proj: Tensor, aud_mask: Optional[Tensor] = None) -> Tensor:
-        """
-        WARN: res must be unnormalized in order to do residual connection
-        ca_mask is None during inference
-        """
-        hidden = self.cross_attn.attention_forward(q_proj, k_proj, v_proj, aud_mask)
-        res = res + hidden
-        res = res + self.mlp(self.mlp_norm(res))
-        return res
-
     def forward(
             self,
             q: Tensor,
@@ -286,20 +293,18 @@ class DecoderBlock(nn.Module):
         RoPE on q_proj and k_proj right before attention forward
         """
         # NOTE: q is not normalized when passing to self_attn cuz it is used as q_proj, and I only apply rotation.
-        hidden = self.self_attn(q, ctx, sa_cos_sin, attn_mask, tok_mask, kv_cache[0])
-        res = q + hidden
-        hidden = self.cross_attn(self.ca_norm(res), aud, ca_cos_sin, aud_mask, kv_cache[1])
-        res = res + hidden
-        res = res + self.mlp(self.mlp_norm(res))
-        return res
+        hidden = q + self.self_attn(q, ctx, sa_cos_sin, attn_mask, tok_mask, kv_cache[0])
+        hidden = hidden + self.cross_attn(self.ca_norm(hidden), aud, ca_cos_sin, aud_mask, kv_cache[1])
+        hidden = hidden + self.mlp(self.mlp_norm(hidden))
+        return hidden
 
 
 class LengthPredictor(nn.Module):
-    def __init__(self, n_text_ctx: int, pad_id: int, eot_id: int, transcribe_id: int, n_embed: int, dropout: float, bias: bool):
+    def __init__(self, n_text_ctx: int, pad_token_id: int, eot_token_id: int, transcribe_id: int, n_embed: int, dropout: float, bias: bool):
         super().__init__()
         self.half_text_ctx = 0.5 * n_text_ctx
-        self.pad_id = pad_id
-        self.eot_id = eot_id
+        self.pad_token_id = pad_token_id
+        self.eot_token_id = eot_token_id
         self.transcribe_id = transcribe_id
         self.no_speech_id = transcribe_id + 2  # this is due to TrorYongASR tokenizer design
         self.conv3 = Conv1dWrapper(n_embed, n_embed, kernel_size=5, stride=5)
@@ -315,7 +320,7 @@ class LengthPredictor(nn.Module):
         aud_enc: (b, n_mels, n_frames)
         task_ids: (b, 1)
         """
-        task_ids.masked_fill_((task_ids == self.pad_id) | (task_ids == self.eot_id), self.no_speech_id)  # for no_speech case, replace eot_id or pad_id by no_speech_id
+        task_ids.masked_fill_((task_ids == self.pad_token_id) | (task_ids == self.eot_token_id), self.no_speech_id)  # for no_speech case, replace eot_token_id or pad_token_id by no_speech_id
         task_ids = task_ids - self.transcribe_id  # convert to class: 0 (transcribe) or 1 (translate) or 2 (no_speech)
         task = self.dropout(self.task_embed(task_ids).squeeze(1))  # (b, n_embed)
         # Apply FiLM on the audio encoding
@@ -360,8 +365,8 @@ class TrorYongASRConfig:
     bias: bool = True
     gamma: float = 10.0  # scaling factor for LARoPE
     rope_percentage: float = 0.75  # for p-RoPE and p-LARoPE
-    pad_id: int = 0
-    eot_id: int = 2
+    pad_token_id: int = 0
+    eot_token_id: int = 2
     transcribe_id: int = 48002
     tie_word_embeddings: bool = True
 
@@ -373,6 +378,11 @@ class TrorYongASRModel(
     def __init__(self, config: TrorYongASRConfig, verbose: bool=True) -> None:
         super().__init__()
         self.config = config
+        self.generation_config = GenerationConfig()
+        self.generation_config.pad_token_id = self.config.pad_token_id
+        self.generation_config.eos_token_id = self.config.eot_token_id
+        self.generation_config.lang_to_id = {"km": 48000, "en": 48001}
+        self.generation_config.task_to_id = {"transcribe": 48002, "translate": 48003}
 
         self.encoder = AudioEncoder(
             config.n_mels,
@@ -396,7 +406,7 @@ class TrorYongASRModel(
         # Make vocab_size multiple of 32
         self.vocab_size = config.vocab_size
         self.pad_vocab_size = (config.vocab_size + 31) // 32 * 32
-        self.tok_embed = nn.Embedding(self.pad_vocab_size, config.n_embed, padding_idx=self.config.pad_id)
+        self.tok_embed = nn.Embedding(self.pad_vocab_size, config.n_embed, padding_idx=self.config.pad_token_id)
         self.aud_norm = Qwen3RMSNorm(config.n_embed)
         self.ctx_norm = Qwen3RMSNorm(config.n_embed)
         self.lm_norm = Qwen3RMSNorm(config.n_embed)
@@ -423,15 +433,14 @@ class TrorYongASRModel(
         # Sequence Length Predictor, used for LARoPE's inference
         self.len_predictor = LengthPredictor(
             config.n_text_ctx,
-            config.pad_id,
-            config.eot_id,
+            config.pad_token_id,
+            config.eot_token_id,
             config.transcribe_id,
             config.n_embed,
             config.dropout,
             config.bias
         )  # sequence length predictor specific to LARoPE
 
-        # mask = torch.empty(config.n_text_ctx, config.n_text_ctx).fill_(-float('inf')).triu_(1)
         mask = torch.tril(torch.ones((self.config.n_text_ctx, self.config.n_text_ctx), dtype=torch.bool))
         self.register_buffer("mask", mask, persistent=False)
         self.prefix = None
@@ -471,7 +480,7 @@ class TrorYongASRModel(
 
         attn_mask = None
         if L > 1:  # always True during training. During inference, True for the initial tokens
-            attn_mask = self.mask[T0:T1, T0:T1]
+            attn_mask = self.mask[T0:T1, T0:T1].view(1, 1, L, L)
 
         # T1+1 because Q is one-phase faster than K
         sa_cos_sin = self.cos[:, :, T0+1:T1+1], self.sin[:, :, T0+1:T1+1], self.cos[:, :, T0:T1], self.sin[:, :, T0:T1]
@@ -502,20 +511,21 @@ class TrorYongASRModel(
         logits = self.lm_head(self.lm_norm(res))  # (b, L, pad_vocab_size)
         return logits[..., :self.vocab_size]
 
-    def forward(self, mels: Tensor, mel_masks: Tensor, input_ids: Tensor, target_ids: Optional[Tensor] = None) -> CausalLMOutput:
+    def forward(self, mels: Tensor, mel_masks: Tensor, input_ids: Tensor, labels: Optional[Tensor] = None) -> CausalLMOutput:
         """
         mels: log-mel spectrum from audio array
+        mel_masks: True means valid frame, False means pad frame
         input_ids: input token ids for decoder (inclu. sot sequence)
-        target_ids: target token ids to compute cross_entropy loss
+        labels: target token ids to compute cross_entropy loss
         """
 
         # NOTE: in Whisper Audio Encoder, the audio encoding is not normalized by ln_post()
         aud_enc, aud_mask = self.encoder(mels, mel_masks)
-        tok_mask = input_ids != self.config.pad_id
-        ctx = self.get_token_embedding(input_ids)
+        tok_mask = input_ids != self.config.pad_token_id
+        ctx = self.pos_basis.view(1, 1, -1) * self.get_token_embedding(input_ids)
         ctx = self.dropout(ctx)
-        if target_ids is None:
-            logits = self.logits(self.aud_norm(aud_enc), self.ctx_norm(ctx), aud_mask, tok_mask)  # (b, L, pad_vocab_size)
+        if labels is None:
+            logits = self.logits(self.aud_norm(aud_enc), self.ctx_norm(ctx), aud_mask, tok_mask)  # (b, L, vocab_size)
             # do not compute loss
             return CausalLMOutput(logits=logits)
         else:
@@ -523,19 +533,19 @@ class TrorYongASRModel(
             # pred_len is bounded on [0, n_text_ctx] via softcap and shift
             pred_len = self.len_predictor(aud_enc.detach(), input_ids[:, [2]], aud_mask)
             target_len = torch.sum(tok_mask, dim=-1, dtype=torch.float32)
-            loss = F.smooth_l1_loss(pred_len.float(), target_len, beta=1.0)
+            len_loss = F.smooth_l1_loss(pred_len.float(), target_len, beta=1.0)
 
-            logits = self.logits(self.aud_norm(aud_enc), self.ctx_norm(ctx), aud_mask, tok_mask)  # (b, L, pad_vocab_size)
-            loss += F.cross_entropy(logits.flatten(end_dim=1).float(), target_ids.flatten(), ignore_index=-100, reduction='mean')
+            logits = self.logits(self.aud_norm(aud_enc), self.ctx_norm(ctx), aud_mask, tok_mask)  # (b, L, vocab_size)
+            dec_loss = F.cross_entropy(logits.reshape(-1, self.vocab_size).float(), labels.reshape(-1), ignore_index=-100, reduction='mean')
 
-            return CausalLMOutput(logits=logits, loss=loss)
+            return CustomCausalLMOutput(logits=logits, loss=dec_loss+len_loss, dec_loss=dec_loss, len_loss=len_loss)
 
     def compute_cos_sin(
             self,
             seq_len: float,
             device: torch.device,
             actual_seq_len: Optional[Tensor] = None,
-            dtype = torch.float32
+            dtype=torch.float32
         ) -> tuple[Tensor, Tensor]:
         # Different from RoPE by normalize pos with the seq_len
         # seq_len may include pad tokens, actual_seq_len does not
@@ -570,10 +580,10 @@ class TrorYongASRModel(
         Predicting the language of audio
         """
         mels = mel.unsqueeze(0)
-        aud_enc = self.encoder.encode(mels)
+        aud_enc = self.encode(mels)
 
         idx = torch.as_tensor([[tokenizer.sot]], dtype=torch.long, device=self.device)
-        ctx = self.get_token_embedding(idx)
+        ctx = self.pos_basis.view(1, 1, -1) * self.get_token_embedding(idx)
         logits = self.logits(self.aud_norm(aud_enc), self.ctx_norm(ctx), pred_seq_len=1.0)
 
         # suppress non-language tokens
@@ -592,6 +602,23 @@ class TrorYongASRModel(
 
         return language_tokens[0], language_probs[0]
 
+    def generate(self, mels=None, mel_masks=None, generation_max_length=64, **kwargs):
+        if mels is None:
+            raise ValueError("input_ids must be provided for generation.")
+
+        lang_id = self.generation_config.lang_to_id[self.generation_config.language]
+        task_id = self.generation_config.task_to_id[self.generation_config.task]
+        self.set_prefix([1, lang_id, task_id])
+        b = mels.shape[0]
+        generated_seq = []
+
+        for i in range(b):
+            mel = mels[i, :, mel_masks[i]]
+            decode_ids = self.decode(mel, max_tokens=generation_max_length)
+            generated_seq.append(decode_ids)
+        result = pad_sequence(generated_seq, batch_first=True, padding_value=self.generation_config.pad_token_id)
+        return result
+
     @torch.inference_mode()
     def decode(self, mel: Tensor, max_tokens: int, temperature=1.0, top_k=None, seed=168) -> Tensor:
         """
@@ -605,7 +632,7 @@ class TrorYongASRModel(
         max_seq_len = self.config.n_text_ctx
         assert max_tokens <= max_seq_len, "too long sequence generation, consider lower max_tokens"
         kv_cache = [
-            KVCache(1, self.n_head, max_seq_len, self.head_dim, 1), # batch_size=1, num_layers=1
+            KVCache(1, self.n_head, max_seq_len, self.head_dim, 1),  # batch_size=1, num_layers=1
             dict()
         ]
         device = self.device
@@ -615,10 +642,10 @@ class TrorYongASRModel(
             rng.manual_seed(seed)
 
         mels = mel.unsqueeze(0)
-        aud_enc = self.encoder.encode(mels)
+        aud_enc = self.encode(mels)
 
         idx = torch.as_tensor([self.prefix], dtype=torch.long, device=mels.device)
-        ctx = self.get_token_embedding(idx)
+        ctx = self.pos_basis.view(1, 1, -1) * self.get_token_embedding(idx)
         n = idx.shape[1]
 
         # predict seq_len
@@ -638,9 +665,9 @@ class TrorYongASRModel(
             else:
                 id_next = logits[:, [-1], :].argmax(dim=-1)
             idx = torch.cat((idx, id_next), dim=1)
-            if id_next.item() == self.config.eot_id:
+            if id_next.item() == self.config.eot_token_id:
                 break
-            ctx = self.get_token_embedding(id_next)
+            ctx = self.pos_basis.view(1, 1, -1) * self.get_token_embedding(id_next)
         return idx[0]
 
     @torch.no_grad()
@@ -668,7 +695,7 @@ class TrorYongASRModel(
         nn.init.uniform_(self.decoder.mlp.up_proj.weight, -s * 0.4, s * 0.4)
         nn.init.zeros_(self.decoder.mlp.down_proj.weight)
 
-        nn.init.kaiming_normal_(self.len_predictor.conv3.weight, mode='fan_out', nonlinearity='relu')
+        nn.init.kaiming_normal_(self.len_predictor.conv3.weight, mode='fan_out')
         nn.init.trunc_normal_(self.len_predictor.task_embed.weight, std=1.0)
         nn.init.normal_(self.len_predictor.head.weight, mean=0.0, std=0.001)
         nn.init.zeros_(self.len_predictor.ab_proj.weight)
