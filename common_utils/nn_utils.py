@@ -28,7 +28,7 @@ def precompute_rotary_emb(seq_len, head_dim, device, base=10000, rope_percentage
 
 
 def norm(x):
-    return F.rms_norm(x, (x.size(-1), ))
+    return F.rms_norm(x, (x.size(-1), ), eps=1e-6)
 
 
 def apply_rotary_emb(x, cos, sin):
