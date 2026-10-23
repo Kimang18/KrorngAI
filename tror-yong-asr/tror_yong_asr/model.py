@@ -598,7 +598,7 @@ class TrorYongASRModel(
 
         lang_id = self.generation_config.lang_to_id[self.generation_config.language]
         task_id = self.generation_config.task_to_id[self.generation_config.task]
-        self.set_prefix([1, lang_id, task_id])
+        self.set_prefix([1, lang_id, task_id]) # 1 is sot_token_id
         b = mels.shape[0]
         generated_seq = []
 
